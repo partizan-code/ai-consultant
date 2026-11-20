@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import uuid4
 
 import streamlit as st
@@ -27,10 +28,60 @@ STATUS_LABELS = {
     "unknown": "Результат неизвестен — повтор заблокирован",
     "blocked": "Отправка заблокирована",
 }
+PANEL_STYLES = """
+<style>
+    /* Keep content below Streamlit's fixed toolbar. */
+    .block-container { padding-top: 4rem; }
+    .block-container :is(h1, h2, h3, h4, h5, h6) {
+        font-size: 1.125rem;
+        line-height: 1.35;
+    }
+    .st-key-panel_header [data-testid="stVerticalBlock"] { gap: 0.35rem; }
+    .st-key-panel_header h1 {
+        padding: 0;
+        margin: 0;
+    }
+    .st-key-panel_header hr { margin: 0.35rem 0; }
+    .st-key-chat_tabs button { text-align: left; justify-content: flex-start; }
+    .st-key-chat_tabs [data-testid="stVerticalBlock"] { gap: 0.4rem; }
+    .st-key-chat_thread [data-testid="stVerticalBlock"] { gap: 0.25rem; }
+    .st-key-chat_thread [data-testid="stChatMessage"] {
+        padding: 0.45rem 0.65rem;
+        gap: 0.5rem;
+        border-radius: 0.65rem;
+    }
+    .st-key-chat_thread [data-testid="stText"] {
+        font-size: 0.9rem;
+        line-height: 1.35;
+    }
+    .st-key-chat_thread [data-testid="stCaptionContainer"] {
+        /* Streamlit's negative markdown margin assumes a full paragraph margin. */
+        margin: 0;
+        font-size: 0.68rem;
+        line-height: 1.25;
+        opacity: 0.65;
+    }
+    .st-key-chat_thread [data-testid="stCaptionContainer"] p {
+        margin: 0;
+        font-size: inherit;
+        line-height: inherit;
+    }
+</style>
+"""
+
+
+def format_message_time(value: str) -> str:
+    """Format the stored timestamp without changing its time zone."""
+    try:
+        return datetime.fromisoformat(value).strftime("%d-%m-%Y %H:%M")
+    except ValueError:
+        return "—"
 
 
 def page_offset(label: str, total: int, settings: Settings, key: str) -> int:
     pages = max(1, (total + settings.panel_page_size - 1) // settings.panel_page_size)
+    if pages == 1:
+        return 0
     page = st.number_input(label, min_value=1, max_value=pages, step=1, key=key)
     return (int(page) - 1) * settings.panel_page_size
 
@@ -64,17 +115,19 @@ def show_chat_updates(settings: Settings, chat_id: int) -> None:
 def show_chat_data(settings: Settings, chat_id: int) -> None:
     detail = admin_request(settings, "GET", f"chats/{chat_id}")
     paused = bool(detail["chat"]["paused"])
-    st.subheader("Карточка клиента")
-    st.table(
-        [
-            {"Поле": label, "Значение": detail["lead"][key] or "—"}
-            for key, label in LEAD_LABELS.items()
-        ]
-    )
-    st.caption("Бот на паузе" if paused else "Бот активен")
-    if st.button("Возобновить бота" if paused else "Пауза бота", key=f"pause_{chat_id}"):
-        admin_request(settings, "POST", f"chats/{chat_id}/pause", {"paused": not paused})
-        st.rerun()
+    status, actions = st.columns([3, 1])
+    status.caption("Бот на паузе" if paused else "Бот активен")
+    with actions:
+        if st.button("Возобновить бота" if paused else "Пауза бота", key=f"pause_{chat_id}"):
+            admin_request(settings, "POST", f"chats/{chat_id}/pause", {"paused": not paused})
+            st.rerun()
+    with st.expander("Карточка клиента"):
+        st.table(
+            [
+                {"Поле": label, "Значение": detail["lead"][key] or "—"}
+                for key, label in LEAD_LABELS.items()
+            ]
+        )
     blocked = detail["reply_block_reason"]
     if blocked:
         st.warning("Личный ответ после комментария пока недоступен: " + blocked)
@@ -90,17 +143,23 @@ def show_messages(settings: Settings, chat_id: int, detail: dict) -> None:
     )
     if offset:
         detail = admin_request(settings, "GET", f"chats/{chat_id}?offset={offset}")
-    for message in detail["messages"]:
-        role = "user" if message["direction"] == "incoming" else "assistant"
-        with st.chat_message(role):
-            st.caption(message["occurred_at"] + (" · импорт" if message["imported"] else ""))
-            st.text(message["text"] or "[Сообщение без текста]")
-            if message["post_url"]:
-                st.text("Пост: " + message["post_url"])
-            if message["post_description"]:
-                st.text(message["post_description"])
-            if message["post_owner"]:
-                st.text("Автор поста: " + message["post_owner"])
+    with st.container(height=420, border=True, key="chat_thread"):
+        if not detail["messages"]:
+            st.info("В этом чате пока нет сообщений.")
+        for message in detail["messages"]:
+            role = "user" if message["direction"] == "incoming" else "assistant"
+            with st.chat_message(role):
+                st.text(message["text"] or "[Сообщение без текста]")
+                if message["post_url"]:
+                    st.text("Пост: " + message["post_url"])
+                if message["post_description"]:
+                    st.text(message["post_description"])
+                if message["post_owner"]:
+                    st.text("Автор поста: " + message["post_owner"])
+                st.caption(
+                    format_message_time(message["occurred_at"])
+                    + (" · импорт" if message["imported"] else "")
+                )
     if st.button("Импортировать историю", key=f"history_{chat_id}"):
         result = admin_request(settings, "POST", f"chats/{chat_id}/import-history")
         st.success(f"Добавлено сообщений: {result['imported']}. Для просмотра обновите данные.")
@@ -186,28 +245,48 @@ def show_chats(settings: Settings) -> None:
     if not listing["total"]:
         st.info("Чатов пока нет. Они появятся после первого webhook.")
         return
-    offset = page_offset("Страница чатов", listing["total"], settings, "chats_page")
-    if offset:
-        listing = admin_request(settings, "GET", f"chats?offset={offset}")
-    chats = {chat["id"]: chat for chat in listing["items"]}
-    if not chats:
-        return
+    chat_list, conversation = st.columns([1, 3], gap="large")
+    chat_tabs = chat_list.container(key="chat_tabs")
+    with chat_tabs:
+        st.subheader("Чаты")
+        offset = page_offset("Страница чатов", listing["total"], settings, "chats_page")
+        if offset:
+            listing = admin_request(settings, "GET", f"chats?offset={offset}")
+        chats = {chat["id"]: chat for chat in listing["items"]}
+        if not chats:
+            st.info("На этой странице нет чатов.")
+            return
+        if st.session_state.get("selected_chat_id") not in chats:
+            st.session_state["selected_chat_id"] = next(iter(chats))
+        with st.container(height=560, border=False):
+            for chat_id, chat in chats.items():
+                name = chat_title(chat)
+                if st.button(
+                    f"{name} · #{chat_id}",
+                    key=f"chat_tab_{chat_id}",
+                    type="primary"
+                    if st.session_state["selected_chat_id"] == chat_id
+                    else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state["selected_chat_id"] = chat_id
+                    st.rerun()
+                st.caption(f"{chat['source_type']} · черновиков: {chat['pending_drafts']}")
+    with conversation:
+        chat_id = st.session_state["selected_chat_id"]
+        st.subheader(chat_title(chats[chat_id]))
+        st.caption(f"Переписка обновляется каждые {settings.panel_refresh_interval:g} с.")
+        show_chat(settings, chat_id)
 
-    def label(chat_id: int) -> str:
-        chat = chats[chat_id]
-        name = chat["name"] or chat["source_id"]
-        return f"#{chat_id} · {name} · {chat['source_type']} · черновиков: {chat['pending_drafts']}"
 
-    chat_id = st.selectbox("Чат", list(chats), format_func=label, key="selected_chat_id")
-    st.caption(f"Переписка обновляется каждые {settings.panel_refresh_interval:g} с.")
-    show_chat(settings, chat_id)
+def chat_title(chat: dict) -> str:
+    return chat.get("instagram_username") or chat["source_id"]
 
 
 def show_status(settings: Settings) -> None:
     data = admin_request(settings, "GET", "status")
     if not data["worker_enabled"]:
         st.warning("Ключ OpenRouter не задан; обработчик консультаций выключен.")
-    st.write("Задания", data["jobs"])
     st.subheader("Последняя ошибка")
     if data["last_error"]:
         st.table([data["last_error"]])
@@ -240,12 +319,23 @@ def show_settings(settings: Settings) -> None:
 
 
 def render_panel(settings: Settings) -> None:
-    st.set_page_config(page_title="AI-консультант", page_icon="💬", layout="wide")
-    st.title("AI-консультант")
+    st.set_page_config(page_title="Мебельный консультант", page_icon="💬", layout="wide")
+    st.html(PANEL_STYLES)
+    with st.container(key="panel_header"):
+        st.title("Мебельный консультант")
+        navigation, refresh = st.columns([4, 1])
+        with navigation:
+            section = st.radio(
+                "Раздел",
+                ["Чаты и заявки", "Состояние", "Настройки"],
+                horizontal=True,
+                label_visibility="collapsed",
+                key="panel_section",
+            )
+        refresh.button("Обновить данные")
+        st.divider()
     if "send_result" in st.session_state:
         show_result(st.session_state.pop("send_result"))
-    section = st.sidebar.radio("Раздел", ["Чаты и заявки", "Состояние", "Настройки"])
-    st.sidebar.button("Обновить данные")
     try:
         {"Чаты и заявки": show_chats, "Состояние": show_status, "Настройки": show_settings}[
             section

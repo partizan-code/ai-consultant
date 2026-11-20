@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -22,6 +23,7 @@ class MessageEvent:
     post_description: str | None = None
     post_owner: str | None = None
     custom_id: str | None = None
+    instagram_username: str | None = None
 
 
 def identifier(value: Any) -> str:
@@ -35,6 +37,17 @@ def identifier(value: Any) -> str:
 
 def optional_text(value: Any) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
+
+
+def instagram_username(sender: dict[str, Any], integration: dict[str, Any]) -> str | None:
+    """Read the customer's login, never the business login or post owner's name."""
+    if integration.get("type") != "instagramV3" and sender.get("type") != "instagramV3":
+        return None
+    login = sender.get("login")
+    if not isinstance(login, str):
+        return None
+    login = login.strip().removeprefix("@")
+    return login if re.fullmatch(r"[A-Za-z0-9._]{1,30}", login) else None
 
 
 def parse_message(account_id: Any, lead_id: Any, message: Any) -> MessageEvent:
@@ -92,6 +105,7 @@ def parse_message(account_id: Any, lead_id: Any, message: Any) -> MessageEvent:
                 if not incoming and message.get("customId") is not None
                 else None
             ),
+            instagram_username=instagram_username(sender, integration) if incoming else None,
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         raise ValueError("Invalid Umnico message") from None

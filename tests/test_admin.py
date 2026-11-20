@@ -129,6 +129,36 @@ def test_chat_lead_comment_and_pagination(settings: Settings) -> None:
     asyncio.run(run())
 
 
+def test_instagram_profile_does_not_replace_lead_name(settings: Settings) -> None:
+    make_draft(settings)
+    with open_database(settings.database_path, timeout=1) as connection, connection:
+        # A database from the previous version may contain an unused name cache.
+        connection.execute(
+            "CREATE TABLE chat_account_names (chat_id INTEGER PRIMARY KEY, account_name TEXT)"
+        )
+        connection.execute("INSERT INTO chat_account_names VALUES (1, 'Старое имя аккаунта')")
+    enriched = event()
+    enriched["message"]["sender"] = {"login": "anna.instagram", "type": "instagramV3"}
+    assert ingest_event(settings, enriched) == "duplicate"
+
+    async def run():
+        async with api(settings) as client:
+            listing = (await client.get("/admin/chats", headers=HEADERS)).json()["items"][0]
+            assert listing["instagram_username"] == "anna.instagram"
+            assert listing["name"] == "Анна"
+            assert "account_name" not in listing
+            detail = (await client.get("/admin/chats/1", headers=HEADERS)).json()
+            assert detail["chat"]["instagram_username"] == "anna.instagram"
+            assert detail["lead"]["name"] == "Анна"
+            assert len(detail["drafts"]) == 1 and detail["drafts"][0]["status"] == "pending"
+
+    asyncio.run(run())
+    with open_database(settings.database_path, timeout=1) as connection:
+        assert connection.execute("SELECT account_name FROM chat_account_names").fetchone()[0] == (
+            "Старое имя аккаунта"
+        )
+
+
 @pytest.mark.parametrize(
     "body",
     [

@@ -37,11 +37,12 @@ def update_settings(settings: Settings, model: str, auto_reply: bool) -> dict[st
 def list_chats(settings: Settings, offset: int = 0) -> dict[str, Any]:
     with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
         rows = connection.execute(
-            "SELECT c.*, l.name, l.phone, l.furniture_type, l.city, "
+            "SELECT c.*, p.instagram_username, l.name, l.phone, l.furniture_type, l.city, "
             "(SELECT text FROM messages WHERE chat_id = c.id ORDER BY id DESC LIMIT 1) "
             "AS last_text, (SELECT COUNT(*) FROM drafts WHERE chat_id = c.id "
             "AND status = 'pending') AS pending_drafts "
             "FROM chats c LEFT JOIN leads l ON l.chat_id = c.id "
+            "LEFT JOIN chat_profiles p ON p.chat_id = c.id "
             "ORDER BY (SELECT MAX(id) FROM messages WHERE chat_id = c.id) DESC, c.id DESC "
             "LIMIT ? OFFSET ?",
             (settings.panel_page_size, offset),
@@ -56,7 +57,11 @@ def chat_detail(settings: Settings, chat_id: int, offset: int = 0) -> dict[str, 
     with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
         # Keep the snapshot consistent while the worker/webhooks write on other connections.
         connection.execute("BEGIN")
-        chat = connection.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
+        chat = connection.execute(
+            "SELECT c.*, p.instagram_username FROM chats c "
+            "LEFT JOIN chat_profiles p ON p.chat_id = c.id WHERE c.id = ?",
+            (chat_id,),
+        ).fetchone()
         if chat is None:
             raise LookupError("Chat not found")
         messages = connection.execute(

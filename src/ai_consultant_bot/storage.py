@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (chat_id, external_id)
 );
+CREATE TABLE IF NOT EXISTS chat_profiles (
+    chat_id INTEGER PRIMARY KEY REFERENCES chats(id),
+    instagram_username TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS leads (
     chat_id INTEGER PRIMARY KEY REFERENCES chats(id),
     name TEXT,
@@ -234,16 +239,24 @@ def store_event(
     Replayed imported messages stay imported and never acquire a reply job.
     """
     existing = connection.execute(
-        "SELECT m.id, m.direction FROM messages m JOIN chats c ON c.id = m.chat_id "
+        "SELECT m.id, m.direction, m.chat_id, c.lead_id, c.source_type, c.source_id "
+        "FROM messages m JOIN chats c ON c.id = m.chat_id "
         "WHERE c.account_id = ? AND c.integration_id = ? AND m.external_id = ?",
         (event.chat.account_id, event.chat.integration_id, event.external_id),
     ).fetchone()
     if existing is not None:
         if existing["direction"] != event.direction:
             raise ValueError("Conflicting message direction")
+        if (
+            existing["lead_id"] == event.chat.lead_id
+            and existing["source_type"] == event.chat.source_type
+            and existing["source_id"] == event.chat.source_id
+        ):
+            save_chat_profile(connection, existing["chat_id"], event)
         save_outgoing_receipt(connection, existing["id"], event)
         return False
     chat_id = save_chat(connection, event.chat)
+    save_chat_profile(connection, chat_id, event)
     save_message(
         connection,
         chat_id=chat_id,
@@ -280,6 +293,19 @@ def store_event(
         if event.text.strip():
             connection.execute("INSERT INTO jobs(message_id) VALUES (?)", (message_id,))
     return True
+
+
+def save_chat_profile(connection: sqlite3.Connection, chat_id: int, event: MessageEvent) -> None:
+    """Enrich replayed history too, without letting older logins replace newer ones."""
+    if event.direction != "incoming" or event.instagram_username is None:
+        return
+    connection.execute(
+        "INSERT INTO chat_profiles(chat_id, instagram_username, occurred_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET instagram_username = excluded.instagram_username, "
+        "occurred_at = excluded.occurred_at "
+        "WHERE julianday(excluded.occurred_at) >= julianday(chat_profiles.occurred_at)",
+        (chat_id, event.instagram_username, event.occurred_at),
+    )
 
 
 def reconcile_outgoing_attempt(connection: sqlite3.Connection, request_id: str) -> None:

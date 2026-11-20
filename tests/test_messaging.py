@@ -72,6 +72,7 @@ def rows(settings: Settings, table: str) -> list[dict]:
         "drafts",
         "outgoing_attempts",
         "outgoing_receipts",
+        "chat_profiles",
     }
     with open_database(settings.database_path, timeout=1) as connection:
         return [dict(row) for row in connection.execute(f"SELECT * FROM {table}")]
@@ -103,6 +104,62 @@ def test_comment_without_preview_and_with_post_context(preview: dict | None) -> 
     assert parsed.text == "Нужен диван"
     assert parsed.post_url == "https://example.org/post"
     assert parsed.post_description == (preview["description"] if preview else None)
+
+
+@pytest.mark.parametrize("source_type", ["message", "comment"])
+def test_instagram_login_is_separate_from_business_and_post_names(
+    settings: Settings, source_type: str
+) -> None:
+    event = incoming(source_type=source_type)
+    event["message"]["sender"] = {"login": " @customer.name_1 ", "type": "instagramV3"}
+    event["message"]["sa"]["login"] = "business_account"
+    event["message"]["source"]["name"] = "Название поста"
+    event["message"]["preview"] = {"owner": "post_owner"}
+    assert ingest_event(settings, event) == "saved"
+    assert rows(settings, "chat_profiles")[0]["instagram_username"] == "customer.name_1"
+
+
+@pytest.mark.parametrize("login", [None, "", " ", "@", "not a login", "x" * 31, 123, {}])
+def test_missing_or_invalid_instagram_login_does_not_reject_message(login: object) -> None:
+    event = incoming()
+    event["message"]["sender"] = {"login": login}
+    parsed = parse_event(event)
+    assert parsed is not None and parsed.instagram_username is None
+
+
+def test_outgoing_and_other_channels_do_not_supply_instagram_login() -> None:
+    event = incoming()
+    event["message"]["sender"] = {"login": "business_account", "type": "instagramV3"}
+    event["type"], event["message"]["incoming"] = "message.outgoing", False
+    assert parse_event(event).instagram_username is None
+    event["type"], event["message"]["incoming"] = "message.incoming", True
+    event["message"]["sa"]["type"] = event["message"]["sender"]["type"] = "vkGroup"
+    assert parse_event(event).instagram_username is None
+
+
+def test_profile_enrichment_on_replay_preserves_route_and_latest_login(settings: Settings) -> None:
+    event = incoming()
+    assert ingest_event(settings, event) == "saved"
+    event["message"]["sender"] = {"login": "customer"}
+    assert ingest_event(settings, event) == "duplicate"
+    assert rows(settings, "chat_profiles")[0]["instagram_username"] == "customer"
+
+    replay = copy.deepcopy(event)
+    replay["leadId"] = 999
+    replay["message"]["sender"]["login"] = "wrong_route"
+    assert ingest_event(settings, replay) == "duplicate"
+    assert rows(settings, "chat_profiles")[0]["instagram_username"] == "customer"
+    assert len(rows(settings, "jobs")) == len(rows(settings, "chats")) == 1
+
+    renamed = copy.deepcopy(event)
+    renamed["message"]["messageId"] = "renamed"
+    renamed["message"]["datetime"] = "2026-11-20T14:00:00+03:00"
+    renamed["message"]["sender"]["login"] = "renamed_customer"
+    assert ingest_event(settings, renamed) == "saved"
+    assert ingest_event(settings, event) == "duplicate"
+    assert rows(settings, "chat_profiles")[0]["instagram_username"] == "renamed_customer"
+    assert ingest_event(settings, incoming("without-profile")) == "saved"
+    assert rows(settings, "chat_profiles")[0]["instagram_username"] == "renamed_customer"
 
 
 @pytest.mark.parametrize(
@@ -178,6 +235,47 @@ def test_paginated_history_never_queues_replies_even_on_later_webhook(settings: 
     assert ingest_event(settings, incoming("old-1")) == "duplicate"
     assert len(rows(settings, "jobs")) == 1
     assert [row["imported"] for row in rows(settings, "messages")] == [0, 1, 1]
+
+
+def test_history_backfills_login_from_existing_messages_without_new_jobs(
+    settings: Settings,
+) -> None:
+    ingest_event(settings, incoming())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v2/messaging/456/history/255"
+        if json.loads(request.content).get("cursor"):
+            return httpx.Response(200, json={"messages": [], "source": 0, "cursor": 0})
+        message = history_message("new")
+        message["sender"] = {"login": "customer_from_history"}
+        outgoing = history_message("reply", incoming_direction=False)
+        outgoing["sender"] = {"login": "business_account"}
+        return httpx.Response(
+            200, json={"messages": [message, outgoing], "source": 255, "cursor": 1795171785523}
+        )
+
+    async def run() -> None:
+        async with UmnicoClient(settings, transport=httpx.MockTransport(handler)) as client:
+            assert await import_history(settings, client, 1) == 1
+            assert await import_history(settings, client, 1) == 0
+
+    asyncio.run(run())
+    assert rows(settings, "chat_profiles")[0]["instagram_username"] == "customer_from_history"
+    assert len(rows(settings, "messages")) == 2 and len(rows(settings, "jobs")) == 1
+
+
+def test_old_database_adds_profiles_without_changing_saved_data(settings: Settings) -> None:
+    ingest_event(settings, incoming())
+    with open_database(settings.database_path, timeout=1) as connection, connection:
+        connection.execute("INSERT INTO leads(chat_id, name) VALUES (1, 'Анна')")
+        connection.execute("UPDATE chats SET paused = 1")
+        connection.execute("DROP TABLE chat_profiles")  # Synthetic pre-upgrade database only.
+        initialize_database(connection, settings)
+        initialize_database(connection, settings)
+        assert connection.execute("SELECT name FROM leads").fetchone()[0] == "Анна"
+        assert connection.execute("SELECT paused FROM chats").fetchone()[0] == 1
+    assert len(rows(settings, "messages")) == len(rows(settings, "jobs")) == 1
+    assert rows(settings, "chat_profiles") == []
 
 
 @pytest.mark.parametrize("case", ["loop", "source", "shape", "limit"])

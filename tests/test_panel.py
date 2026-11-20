@@ -10,6 +10,7 @@ from streamlit.testing.v1 import AppTest
 from streamlit.testing.v1.local_script_runner import LocalScriptRunner
 
 from ai_consultant_bot.config import Settings
+from ai_consultant_bot.panel import format_message_time
 from ai_consultant_bot.panel_client import PanelError, admin_request
 from ai_consultant_bot.panel_startup import main
 
@@ -49,10 +50,11 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             return {"calls": [], "last_error": None, "jobs": {}, "worker_enabled": False}
         if path == "knowledge/reload":
             return {"chunks": 2}
-        if path == "chats":
+        if path == "chats" or path.startswith("chats?offset="):
+            offset = int(path.partition("offset=")[2] or 0)
             return {
                 "total": len(state.chats),
-                "items": state.chats,
+                "items": state.chats[offset : offset + settings.panel_page_size],
             }
         if path in {"chats/1", "chats/2"}:
             return {
@@ -102,13 +104,13 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     return state
 
 
-def panel() -> AppTest:
+def panel(*, page_size: int = 50) -> AppTest:
     # Explicit Settings: never read the user's .env or open their database.
     return AppTest.from_string(
         "from ai_consultant_bot.panel import render_panel\n"
         "from ai_consultant_bot.config import Settings\n"
-        "render_panel(Settings(admin_token='synthetic-admin'))\n"
-    ).run(timeout=10)
+        f"render_panel(Settings(admin_token='synthetic-admin', panel_page_size={page_size}))\n"
+    ).run(timeout=30)
 
 
 def button(app: AppTest, label: str):
@@ -118,14 +120,14 @@ def button(app: AppTest, label: str):
 def test_panel_settings_status_and_reload(backend: SimpleNamespace) -> None:
     app = panel()
     assert not app.exception
-    app.sidebar.radio[0].set_value("Настройки").run()
+    app.radio(key="panel_section").set_value("Настройки").run()
     app.text_input[0].set_value("new/model")
     app.toggle[0].set_value(True)
     button(app, "Сохранить настройки").click().run()
     assert backend.settings == {"model": "new/model", "auto_reply": True}
     button(app, "Обновить базу знаний").click().run()
     assert any("фрагментов — 2" in item.value for item in app.success)
-    app.sidebar.radio[0].set_value("Состояние").run()
+    app.radio(key="panel_section").set_value("Состояние").run()
     assert not app.exception and len(app.warning) == 1
 
 
@@ -271,7 +273,7 @@ def test_timer_updates_chat_without_redrawing_form_or_sending(
     monkeypatch.setattr(views, "show_manual_reply", form)
     backend.chats.append({**backend.chats[0], "id": 2, "name": "Борис"})
     app = panel()
-    app.selectbox[0].set_value(2).run()
+    app.button(key="chat_tab_2").click().run()
     # AppTest omits unsubmitted form values on .run(); seed the stored widget
     # value, then verify a real fragment event never redraws that form.
     app.session_state["manual_text_2_0"] = "Набираемый ответ"
@@ -302,8 +304,118 @@ def test_timer_updates_chat_without_redrawing_form_or_sending(
     timer.active = False
     app.run()
     assert not app.exception and app.text_area[0].value == "Набираемый ответ"
-    assert app.selectbox[0].value == 2
+    assert app.button(key="chat_tab_2").proto.type == "primary"
     assert not backend.attempts
+
+
+def test_chat_tabs_open_only_selected_chat_and_keep_selection(backend: SimpleNamespace) -> None:
+    backend.chats.append({**backend.chats[0], "id": 2, "name": "Борис"})
+    app = panel()
+    assert not app.sidebar.radio and not app.selectbox
+    backend.calls.clear()
+    app.button(key="chat_tab_2").click().run()
+    assert not app.exception
+    assert app.session_state["selected_chat_id"] == 2
+    assert any(path == "chats/2" for _, path, _ in backend.calls)
+    assert not any(path == "chats/1" for _, path, _ in backend.calls)
+    assert app.button(key="chat_tab_2").proto.type == "primary"
+    assert app.button(key="chat_tab_1").proto.type == "secondary"
+    app.radio(key="panel_section").set_value("Настройки").run()
+    app.radio(key="panel_section").set_value("Чаты и заявки").run()
+    button(app, "Обновить данные").click().run()
+    assert not app.exception and app.session_state["selected_chat_id"] == 2
+    assert not backend.attempts
+
+
+def test_chat_tabs_follow_pagination(backend: SimpleNamespace) -> None:
+    backend.chats.append({**backend.chats[0], "id": 2, "name": "Борис"})
+    app = panel(page_size=1)
+    assert app.session_state["selected_chat_id"] == 1
+    app.number_input(key="chats_page").set_value(2).run()
+    assert not app.exception and app.session_state["selected_chat_id"] == 2
+    assert [item.key for item in app.button if (item.key or "").startswith("chat_tab_")] == [
+        "chat_tab_2"
+    ]
+    app.number_input(key="chats_page").set_value(1).run()
+    assert not app.exception and app.session_state["selected_chat_id"] == 1
+
+
+@pytest.mark.parametrize("username, title", [("partizan_code", "partizan_code"), (None, "sender")])
+def test_chat_title_uses_login_instead_of_account_or_lead_name(
+    backend: SimpleNamespace, username: str | None, title: str
+) -> None:
+    backend.chats[0]["instagram_username"] = username
+    backend.chats[0]["account_name"] = "Старое имя аккаунта"
+    app = panel()
+    assert not app.exception
+    assert app.button(key="chat_tab_1").label == f"{title} · #1"
+    assert title in [item.value for item in app.subheader]
+    assert "Анна" not in [item.value for item in app.subheader]
+    assert "Старое имя аккаунта" not in [item.value for item in app.subheader]
+
+
+def test_login_title_refresh_does_not_request_display_name(backend: SimpleNamespace) -> None:
+    backend.chats[0]["instagram_username"] = "partizan_code"
+    app = panel()
+    # A running Streamlit session may still contain state from the old lookup.
+    app.session_state["profile_error_1"] = "Имя аккаунта недоступно"
+    app.session_state["refresh_account_profile"] = True
+    app.run()
+    assert not app.exception and not app.warning
+    button(app, "Обновить данные").click().run()
+    assert not app.exception and not app.warning
+    assert app.button(key="chat_tab_1").label == "partizan_code · #1"
+    assert all("/account-profile" not in path for _, path, _ in backend.calls)
+    assert all(method == "GET" for method, _, _ in backend.calls)
+    assert not backend.attempts
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "expected"),
+    [
+        ("2026-11-20T16:04:59Z", "20-11-2026 16:04"),
+        ("2026-01-02T03:04:05.123456+03:00", "02-01-2026 03:04"),
+        ("2026-11-20 16:04:05", "20-11-2026 16:04"),
+        ("", "—"),
+        ("invalid", "—"),
+    ],
+)
+def test_message_time_format(timestamp: str, expected: str) -> None:
+    assert format_message_time(timestamp) == expected
+
+
+def test_compact_messages_keep_text_context_and_import_marker(backend: SimpleNamespace) -> None:
+    backend.messages = [
+        {
+            "direction": "incoming",
+            "occurred_at": "2026-11-20T16:04:59Z",
+            "imported": True,
+            "text": "<script>alert('text')</script>\nВторая строка",
+            "post_url": "https://example.test/post",
+            "post_description": "Описание поста",
+            "post_owner": "Автор",
+        },
+        {
+            "direction": "outgoing",
+            "occurred_at": "2026-11-20T16:05:00Z",
+            "imported": False,
+            "text": None,
+            "post_url": None,
+            "post_description": None,
+            "post_owner": None,
+        },
+    ]
+    app = panel()
+    assert not app.exception and len(app.chat_message) == 2
+    assert app.chat_message[0].caption[0].value == "20-11-2026 16:04 · импорт"
+    assert app.chat_message[1].caption[0].value == "20-11-2026 16:05"
+    assert [item.value for item in app.chat_message[0].text] == [
+        backend.messages[0]["text"],
+        "Пост: https://example.test/post",
+        "Описание поста",
+        "Автор поста: Автор",
+    ]
+    assert app.chat_message[1].text[0].value == "[Сообщение без текста]"
 
 
 def test_timer_recovers_from_backend_error(
