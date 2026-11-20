@@ -33,6 +33,7 @@ def incoming() -> dict:
 def test_webhook_auth_validation_and_deduplication(tmp_path: Path) -> None:
     settings = Settings(
         database_path=tmp_path / "test.sqlite3",
+        knowledge_base_path=tmp_path / "knowledge",
         webhook_token="synthetic-hook",
         admin_token="synthetic-admin",
         webhook_max_bytes=4096,
@@ -83,7 +84,9 @@ def test_webhook_auth_validation_and_deduplication(tmp_path: Path) -> None:
 
 
 def test_missing_tokens_disable_endpoints(tmp_path: Path) -> None:
-    settings = Settings(database_path=tmp_path / "test.sqlite3")
+    settings = Settings(
+        database_path=tmp_path / "test.sqlite3", knowledge_base_path=tmp_path / "knowledge"
+    )
     app = create_app(replace(settings, webhook_max_bytes=10))
 
     async def run() -> None:
@@ -102,7 +105,11 @@ def test_webhook_logs_results_without_secrets_or_payload(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(database_path=tmp_path / "test.sqlite3", webhook_token="private-hook")
+    settings = Settings(
+        database_path=tmp_path / "test.sqlite3",
+        knowledge_base_path=tmp_path / "knowledge",
+        webhook_token="private-hook",
+    )
     app = create_app(settings)
     logs = []
     sink = logger.add(logs.append, format="{level} | {message}")
@@ -153,6 +160,7 @@ def test_webhook_logs_results_without_secrets_or_payload(
 def test_history_send_and_outgoing_webhook_through_admin_api(tmp_path: Path) -> None:
     settings = Settings(
         database_path=tmp_path / "test.sqlite3",
+        knowledge_base_path=tmp_path / "knowledge",
         umnico_api_key="synthetic-key",
         admin_token="synthetic-admin",
         webhook_token="synthetic-hook",
@@ -236,3 +244,58 @@ def test_history_send_and_outgoing_webhook_through_admin_api(tmp_path: Path) -> 
             == "request-1"
         )
         assert connection.execute("SELECT paused FROM chats").fetchone()[0] == 1
+
+
+def test_worker_lifecycle_and_authenticated_knowledge_reload(tmp_path: Path) -> None:
+    settings = Settings(
+        database_path=tmp_path / "test.sqlite3",
+        knowledge_base_path=tmp_path / "knowledge",
+        openrouter_api_key="synthetic-key",
+        webhook_token="synthetic-hook",
+        admin_token="synthetic-admin",
+        processing_poll_interval=0.01,
+    )
+    settings.knowledge_base_path.mkdir()
+    (settings.knowledge_base_path / "sofa.md").write_text("Диван: велюр.", encoding="utf-8")
+    completed = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("chat/completions")
+        completed.set()
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": '{"reply":"Обивка велюр.","lead":{}}'},
+                    }
+                ]
+            },
+        )
+
+    app = create_app(settings, transport=httpx.MockTransport(handler))
+
+    async def run() -> None:
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as client:
+                url = "/admin/knowledge/reload"
+                assert (await client.post(url)).status_code == 401
+                headers = {"Authorization": "Bearer synthetic-admin"}
+                assert (await client.post(url, headers=headers)).json() == {"chunks": 1}
+                (settings.knowledge_base_path / "invalid.txt").write_bytes(b"\xff")
+                assert (await client.post(url, headers=headers)).status_code == 409
+                assert len(app.state.knowledge.chunks) == 1
+                await client.post("/webhooks/umnico/synthetic-hook", json=incoming())
+                await asyncio.wait_for(completed.wait(), timeout=2)
+                with open_database(settings.database_path, timeout=1) as connection:
+                    assert connection.execute("SELECT status FROM jobs").fetchone()[0] == "done"
+                    assert (
+                        connection.execute("SELECT status FROM drafts").fetchone()[0] == "pending"
+                    )
+        assert app.state.openrouter._http.is_closed and app.state.umnico._http.is_closed
+
+    asyncio.run(run())

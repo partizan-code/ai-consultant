@@ -11,6 +11,8 @@ from ai_consultant_bot.api_http import APIError
 from ai_consultant_bot.config import Settings
 from ai_consultant_bot.events import parse_event, parse_history_message
 from ai_consultant_bot.storage import (
+    consultation_is_current,
+    get_setting,
     open_database,
     reconcile_outgoing_attempt,
     record_api_call,
@@ -170,12 +172,19 @@ async def import_history(settings: Settings, client: UmnicoClient, chat_id: int)
 
 
 async def send_text(
-    settings: Settings, client: UmnicoClient, *, chat_id: int, text: str, request_id: str
+    settings: Settings,
+    client: UmnicoClient,
+    *,
+    chat_id: int,
+    text: str,
+    request_id: str,
+    job_id: int | None = None,
 ) -> dict[str, Any]:
-    """Explicit manual send. Persist uncertainty BEFORE I/O; never retry a request ID.
+    """Persist uncertainty BEFORE I/O; never retry a request ID.
 
     New IDs also cannot bypass an unresolved send in this chat, including after restart.
     'sent' means API acceptance, not confirmed delivery to Instagram.
+    An internal job_id selects automatic sending and must still own current work.
     """
     if (
         not text.strip()
@@ -230,22 +239,34 @@ async def send_text(
                 raise APIError("umnico", "unresolved_send")
             if connection.execute(
                 "SELECT 1 FROM jobs j JOIN messages m ON m.id = j.message_id "
-                "WHERE m.chat_id = ? AND j.status IN ('processing', 'unknown')",
-                (chat_id,),
+                "WHERE m.chat_id = ? AND j.status IN ('processing', 'unknown') "
+                "AND (? IS NULL OR j.id != ?)",
+                (chat_id, job_id, job_id),
             ).fetchone():
                 raise APIError("umnico", "chat_processing")
+            if job_id is not None:
+                owner = connection.execute(
+                    "SELECT 1 FROM jobs j JOIN messages m ON m.id = j.message_id "
+                    "WHERE j.id = ? AND m.chat_id = ?",
+                    (job_id, chat_id),
+                ).fetchone()
+                if owner is None or not consultation_is_current(connection, job_id):
+                    raise APIError("umnico", "consultation_superseded")
+                if get_setting(connection, "auto_reply") != "1":
+                    raise APIError("umnico", "auto_reply_disabled")
             connection.execute(
                 "INSERT INTO outgoing_attempts(request_id, chat_id, text, status, error_code) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (request_id, chat_id, text, "blocked" if blocked else "unknown", blocked),
             )
-            if not blocked:
+            if not blocked and job_id is None:
                 connection.execute("UPDATE chats SET paused = 1 WHERE id = ?", (chat_id,))
                 connection.execute(
                     "UPDATE drafts SET status = 'stale' WHERE chat_id = ? "
                     "AND status IN ('pending', 'approved')",
                     (chat_id,),
                 )
+            if not blocked:
                 reconcile_outgoing_attempt(connection, request_id)
                 confirmed = connection.execute(
                     "SELECT * FROM outgoing_attempts WHERE request_id = ? AND status = 'sent'",
@@ -300,7 +321,7 @@ async def send_text(
                     error_code=error_code,
                 )
         if result["status"] == "sent":
-            logger.info("Ручная отправка: сообщение принято Umnico.")
+            logger.info("Отправка: сообщение принято Umnico.")
         else:
-            logger.warning("Ручная отправка завершена со статусом {}.", result["status"])
+            logger.warning("Отправка завершена со статусом {}.", result["status"])
         return result

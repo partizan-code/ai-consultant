@@ -1,12 +1,14 @@
-"""Thin FastAPI endpoints; no AI responses or background processing in step 2."""
+"""Thin FastAPI endpoints and lifecycle for the single-backend consultation worker."""
 
 from __future__ import annotations
 
+import asyncio
+import csv
 import json
 import secrets
 import sqlite3
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import httpx
@@ -17,8 +19,11 @@ from starlette.concurrency import run_in_threadpool
 
 from ai_consultant_bot.api_http import APIError
 from ai_consultant_bot.config import Settings
+from ai_consultant_bot.knowledge import KnowledgeBase
 from ai_consultant_bot.messaging import import_history, ingest_event, send_text
-from ai_consultant_bot.storage import initialize_database, open_database
+from ai_consultant_bot.openrouter import OpenRouterClient
+from ai_consultant_bot.processing import run_worker
+from ai_consultant_bot.storage import initialize_database, open_database, recover_interrupted_jobs
 from ai_consultant_bot.umnico import UmnicoClient
 
 
@@ -39,10 +44,36 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
             initialize_database(connection, settings)
+            with connection:
+                recover_interrupted_jobs(connection)
         logger.info("SQLite готова к работе.")
-        async with UmnicoClient(settings, transport=transport) as client:
+        knowledge = KnowledgeBase(settings)
+        try:
+            await run_in_threadpool(knowledge.reload)
+        except (OSError, ValueError, csv.Error):
+            logger.warning(
+                "База знаний не загружена; консультации доступны без сведений о товарах."
+            )
+        app.state.knowledge = knowledge
+        async with (
+            UmnicoClient(settings, transport=transport) as client,
+            OpenRouterClient(settings, transport=transport) as openrouter,
+        ):
             app.state.umnico = client
-            yield
+            app.state.openrouter = openrouter
+            worker = None
+            if settings.openrouter_api_key:
+                worker = asyncio.create_task(run_worker(settings, knowledge, openrouter, client))
+                logger.info("Обработчик консультаций запущен.")
+            else:
+                logger.warning("Ключ OpenRouter не задан; задания остаются в очереди.")
+            try:
+                yield
+            finally:
+                if worker is not None:
+                    worker.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await worker
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -56,7 +87,7 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
 
     @app.exception_handler(APIError)
     async def api_error(request: Request, error: APIError) -> JSONResponse:
-        logger.warning("Операция Umnico не выполнена: {}.", error)
+        logger.warning("Операция API не выполнена: {}.", error)
         return JSONResponse(status_code=409, content={"error_code": error.code})
 
     @app.exception_handler(sqlite3.Error)
@@ -67,6 +98,17 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.post("/admin/knowledge/reload", dependencies=[Depends(require_admin)])
+    async def reload_knowledge(request: Request) -> dict[str, int]:
+        try:
+            count = await run_in_threadpool(request.app.state.knowledge.reload)
+        except (OSError, ValueError, csv.Error):
+            raise HTTPException(
+                409, "Knowledge reload failed; previous snapshot retained"
+            ) from None
+        logger.info("База знаний обновлена: фрагментов — {}.", count)
+        return {"chunks": count}
 
     @app.post("/webhooks/umnico/{token}")
     async def webhook(token: str, request: Request) -> dict[str, str]:

@@ -86,6 +86,15 @@ def test_explicit_missing_file_raises(tmp_path: Path) -> None:
         {"server_shutdown_timeout": 0},
         {"webhook_limit": 0},
         {"webhook_name": " "},
+        {"processing_poll_interval": 0},
+        {"history_context_messages": 0},
+        {"history_context_chars": 0},
+        {"knowledge_file_max_bytes": 0},
+        {"knowledge_chunk_chars": 0},
+        {"knowledge_max_chunks": 0},
+        {"knowledge_search_results": 0},
+        {"consultation_reply_max_chars": 0},
+        {"lead_field_max_chars": 0},
     ],
 )
 def test_invalid_configuration(values: dict) -> None:

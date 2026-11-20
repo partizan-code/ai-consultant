@@ -54,6 +54,15 @@ class Settings:
     database_timeout: float = 5.0
     token_refresh_margin: float = 30.0
     max_completion_tokens: int = 1000
+    processing_poll_interval: float = 1.0
+    history_context_messages: int = 30
+    history_context_chars: int = 16000
+    knowledge_file_max_bytes: int = 1_048_576
+    knowledge_max_chunks: int = 2000
+    knowledge_chunk_chars: int = 1500
+    knowledge_search_results: int = 4
+    consultation_reply_max_chars: int = 4000
+    lead_field_max_chars: int = 300
 
     def __post_init__(self) -> None:
         if bool(self.umnico_login) != bool(self.umnico_password):
@@ -65,6 +74,7 @@ class Settings:
             "database_timeout",
             "server_startup_timeout",
             "server_shutdown_timeout",
+            "processing_poll_interval",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
@@ -73,6 +83,18 @@ class Settings:
             raise ValueError("token_refresh_margin must be finite and nonnegative")
         if self.max_completion_tokens <= 0:
             raise ValueError("max_completion_tokens must be positive")
+        for name in (
+            "history_context_messages",
+            "history_context_chars",
+            "knowledge_file_max_bytes",
+            "knowledge_max_chunks",
+            "knowledge_chunk_chars",
+            "knowledge_search_results",
+            "consultation_reply_max_chars",
+            "lead_field_max_chars",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
         if not 1 <= self.server_port <= 65535:
             raise ValueError("server_port must be between 1 and 65535")
         if self.history_max_pages <= 0 or self.webhook_max_bytes <= 0:

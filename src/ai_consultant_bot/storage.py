@@ -7,7 +7,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ai_consultant_bot.config import Settings
 
@@ -293,6 +293,21 @@ def reconcile_outgoing_attempt(connection: sqlite3.Connection, request_id: str) 
         "AND m.direction = 'outgoing')",
         (request_id,),
     )
+    confirmed = connection.execute(
+        "SELECT 1 FROM outgoing_attempts WHERE request_id = ? AND status = 'sent'",
+        (request_id,),
+    ).fetchone()
+    if confirmed:
+        connection.execute(
+            "UPDATE drafts SET status = 'sent' WHERE status IN ('pending', 'approved', 'unknown') "
+            "AND message_id IN (SELECT message_id FROM jobs WHERE 'consultation:' || id = ?)",
+            (request_id,),
+        )
+        connection.execute(
+            "UPDATE jobs SET status = 'done' WHERE 'consultation:' || id = ? "
+            "AND status IN ('processing', 'unknown')",
+            (request_id,),
+        )
 
 
 def save_outgoing_receipt(
@@ -347,9 +362,143 @@ def record_api_call(
     *,
     status_code: int | None = None,
     error_code: str | None = None,
+    service: str = "umnico",
 ) -> None:
     connection.execute(
         "INSERT INTO api_calls(service, operation, status_code, elapsed_ms, error_code) "
-        "VALUES ('umnico', ?, ?, ?, ?)",
-        (operation, status_code, elapsed_ms, error_code),
+        "VALUES (?, ?, ?, ?, ?)",
+        (service, operation, status_code, elapsed_ms, error_code),
+    )
+
+
+def get_lead(connection: sqlite3.Connection, chat_id: int) -> Lead:
+    row = connection.execute("SELECT * FROM leads WHERE chat_id = ?", (chat_id,)).fetchone()
+    return Lead(**{name: row[name] for name in asdict(Lead())}) if row else Lead()
+
+
+def consultation_is_current(connection: sqlite3.Connection, job_id: int) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM jobs j JOIN messages m ON m.id = j.message_id "
+            "JOIN chats c ON c.id = m.chat_id WHERE j.id = ? AND j.status = 'processing' "
+            "AND c.paused = 0 AND NOT EXISTS (SELECT 1 FROM messages newer "
+            "WHERE newer.chat_id = c.id AND newer.direction = 'incoming' "
+            "AND newer.imported = 0 AND newer.id > m.id)",
+            (job_id,),
+        ).fetchone()
+        is not None
+    )
+
+
+def load_consultation_context(
+    connection: sqlite3.Connection,
+    job: sqlite3.Row,
+    settings: Settings,
+) -> dict[str, Any]:
+    chat = connection.execute("SELECT * FROM chats WHERE id = ?", (job["chat_id"],)).fetchone()
+    rows = connection.execute(
+        "SELECT direction, text FROM ("
+        "SELECT direction, text, occurred_at, id AS sequence FROM messages WHERE chat_id = ? "
+        "UNION ALL SELECT 'outgoing', a.text, a.created_at, 0 FROM outgoing_attempts a "
+        "WHERE a.chat_id = ? AND a.status = 'sent' AND NOT EXISTS ("
+        "SELECT 1 FROM outgoing_receipts r JOIN messages m ON m.id = r.message_id "
+        "WHERE r.custom_id = a.request_id AND m.chat_id = a.chat_id AND m.text = a.text)) "
+        "ORDER BY (sequence = ?) DESC, julianday(occurred_at) DESC, sequence DESC LIMIT ?",
+        (job["chat_id"], job["chat_id"], job["message_id"], settings.history_context_messages),
+    ).fetchall()
+    remaining = settings.history_context_chars
+    history = []
+    for row in rows:
+        if remaining <= 0:
+            break
+        text = row["text"][-remaining:]
+        history.append({"direction": row["direction"], "text": text})
+        remaining -= len(text)
+    post = connection.execute(
+        "SELECT post_url, post_description, post_owner FROM message_context WHERE message_id = ?",
+        (job["message_id"],),
+    ).fetchone()
+    return {
+        "history": list(reversed(history)),
+        "lead": get_lead(connection, job["chat_id"]),
+        "source_type": chat["source_type"],
+        "post": {key: (post[key] or "")[: settings.knowledge_chunk_chars] for key in post.keys()}
+        if post
+        else {},
+        "model": get_setting(connection, "model"),
+    }
+
+
+def save_consultation(
+    connection: sqlite3.Connection,
+    job: sqlite3.Row,
+    lead: Lead,
+    reply: str,
+) -> int | None:
+    """Caller holds BEGIN IMMEDIATE. A stale generation cannot update a newer draft/lead."""
+    if not consultation_is_current(connection, job["id"]):
+        finish_consultation_job(connection, job["id"], "done")
+        return None
+    save_lead(connection, job["chat_id"], lead)
+    connection.execute(
+        "UPDATE drafts SET status = 'stale' WHERE chat_id = ? AND status IN ('pending', 'approved')",
+        (job["chat_id"],),
+    )
+    cursor = connection.execute(
+        "INSERT INTO drafts(chat_id, message_id, text) VALUES (?, ?, ?)",
+        (job["chat_id"], job["message_id"], reply),
+    )
+    return cursor.lastrowid
+
+
+def finish_consultation_job(
+    connection: sqlite3.Connection,
+    job_id: int,
+    status: str,
+    *,
+    draft_id: int | None = None,
+    draft_status: str | None = None,
+) -> None:
+    connection.execute("UPDATE jobs SET status = ? WHERE id = ?", (status, job_id))
+    if draft_id is not None and draft_status is not None:
+        connection.execute(
+            "UPDATE drafts SET status = ? WHERE id = ? AND status != 'stale'",
+            (draft_status, draft_id),
+        )
+
+
+def recover_interrupted_jobs(connection: sqlite3.Connection) -> int:
+    """Single-backend startup: retry generation only if no send was reserved."""
+    rows = connection.execute(
+        "SELECT j.id, j.message_id, a.status FROM jobs j LEFT JOIN outgoing_attempts a "
+        "ON a.request_id = 'consultation:' || j.id WHERE j.status = 'processing'",
+    ).fetchall()
+    for row in rows:
+        status = row["status"]
+        job_status = "pending" if status is None else "unknown" if status == "unknown" else "done"
+        finish_consultation_job(connection, row["id"], job_status)
+        if status is not None:
+            connection.execute(
+                "UPDATE drafts SET status = ? WHERE message_id = ? AND status != 'stale'",
+                (status if status in {"sent", "unknown"} else "failed", row["message_id"]),
+            )
+    return len(rows)
+
+
+def interrupt_consultation(
+    connection: sqlite3.Connection,
+    job_id: int,
+    draft_id: int | None,
+) -> None:
+    attempt = connection.execute(
+        "SELECT status FROM outgoing_attempts WHERE request_id = ?",
+        (f"consultation:{job_id}",),
+    ).fetchone()
+    status = attempt["status"] if attempt else "failed"
+    finish_consultation_job(
+        connection,
+        job_id,
+        "done" if status in {"sent", "blocked"} else status,
+        draft_id=draft_id,
+        draft_status=status if status in {"sent", "unknown"} else "failed",
     )
