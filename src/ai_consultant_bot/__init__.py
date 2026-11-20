@@ -1,0 +1,1 @@
+"""AI consultant bot application."""

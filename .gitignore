@@ -1,0 +1,36 @@
+# Local environments and tools
+.venv/
+.mise/
+mise.local.toml
+.python-version.local
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local application data
+*.log
+logs/
+*.db
+*.sqlite
+*.sqlite3
+
+# Operating systems
+.DS_Store
+Thumbs.db

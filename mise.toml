@@ -1,0 +1,43 @@
+[tools]
+python = "3.13"
+
+[settings]
+auto_install = false
+task.run_auto_install = false
+python.uv_venv_auto = "source"
+
+[env]
+UV_PYTHON = { value = "{{ tools.python.path }}", tools = true }
+UV_PYTHON_DOWNLOADS = "never"
+
+[tasks.setup]
+description = "Resolve dependencies and sync the uv-managed environment"
+run = "uv sync"
+
+[tasks.lint]
+description = "Check Python lint rules"
+run = "uv run --no-sync ruff check ."
+
+[tasks.lint-fix]
+description = "Apply automatic Python lint fixes"
+run = "uv run --no-sync ruff check --fix ."
+
+[tasks.format]
+description = "Format Python source code"
+run = "uv run --no-sync ruff format ."
+
+[tasks.format-check]
+description = "Check Python formatting"
+run = "uv run --no-sync ruff format --check ."
+
+[tasks.test]
+description = "Run offline smoke tests"
+run = "uv run --no-sync pytest"
+
+[tasks.check]
+description = "Run lint, format checks, and tests"
+depends = ["lint", "format-check", "test"]
+
+[tasks.start]
+description = "Start the application"
+run = "uv run --no-sync ai-consultant-bot"
