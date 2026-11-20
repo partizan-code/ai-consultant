@@ -41,3 +41,7 @@ depends = ["lint", "format-check", "test"]
 [tasks.start]
 description = "Start the application"
 run = "uv run --no-sync ai-consultant-bot"
+
+[tasks.panel]
+description = "Start the local administrator panel"
+run = "uv run --no-sync ai-consultant-panel"

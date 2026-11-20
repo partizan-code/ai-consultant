@@ -63,6 +63,12 @@ class Settings:
     knowledge_search_results: int = 4
     consultation_reply_max_chars: int = 4000
     lead_field_max_chars: int = 300
+    panel_host: str = "127.0.0.1"
+    panel_port: int = 8501
+    panel_page_size: int = 50
+    panel_request_timeout: float = 30.0
+    panel_refresh_interval: float = 3.0
+    model_max_chars: int = 200
 
     def __post_init__(self) -> None:
         if bool(self.umnico_login) != bool(self.umnico_password):
@@ -75,6 +81,8 @@ class Settings:
             "server_startup_timeout",
             "server_shutdown_timeout",
             "processing_poll_interval",
+            "panel_request_timeout",
+            "panel_refresh_interval",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
@@ -92,11 +100,17 @@ class Settings:
             "knowledge_search_results",
             "consultation_reply_max_chars",
             "lead_field_max_chars",
+            "panel_page_size",
+            "model_max_chars",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
         if not 1 <= self.server_port <= 65535:
             raise ValueError("server_port must be between 1 and 65535")
+        if not 1 <= self.panel_port <= 65535 or self.panel_port == self.server_port:
+            raise ValueError("panel_port must be valid and different from server_port")
+        if self.panel_host not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("Panel must listen on localhost")
         if self.history_max_pages <= 0 or self.webhook_max_bytes <= 0:
             raise ValueError("History and webhook limits must be positive")
         if self.webhook_limit <= 0 or not self.webhook_name.strip():

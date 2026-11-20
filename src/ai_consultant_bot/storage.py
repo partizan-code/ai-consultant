@@ -299,6 +299,11 @@ def reconcile_outgoing_attempt(connection: sqlite3.Connection, request_id: str) 
     ).fetchone()
     if confirmed:
         connection.execute(
+            "UPDATE drafts SET status = 'sent' WHERE 'draft:' || id = ? "
+            "AND status IN ('unknown', 'failed')",
+            (request_id,),
+        )
+        connection.execute(
             "UPDATE drafts SET status = 'sent' WHERE status IN ('pending', 'approved', 'unknown') "
             "AND message_id IN (SELECT message_id FROM jobs WHERE 'consultation:' || id = ?)",
             (request_id,),
@@ -501,4 +506,18 @@ def interrupt_consultation(
         "done" if status in {"sent", "blocked"} else status,
         draft_id=draft_id,
         draft_status=status if status in {"sent", "unknown"} else "failed",
+    )
+
+
+def cancel_generation(connection: sqlite3.Connection, chat_id: int) -> None:
+    """Invalidate an in-flight generation even if the chat is immediately resumed.
+
+    A reserved send cannot be recalled. Pending jobs remain queued for resume.
+    """
+    connection.execute(
+        "UPDATE jobs SET status = 'done' WHERE status = 'processing' "
+        "AND message_id IN (SELECT id FROM messages WHERE chat_id = ?) "
+        "AND NOT EXISTS (SELECT 1 FROM outgoing_attempts a "
+        "WHERE a.request_id = 'consultation:' || jobs.id)",
+        (chat_id,),
     )

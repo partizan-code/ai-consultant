@@ -10,7 +10,7 @@ from loguru import logger
 
 from ai_consultant_bot.api_http import APIError
 from ai_consultant_bot.config import Settings
-from ai_consultant_bot.consultation import build_prompt, missing_knowledge_reply, parse_consultation
+from ai_consultant_bot.consultation import build_prompt, parse_consultation
 from ai_consultant_bot.knowledge import KnowledgeBase
 from ai_consultant_bot.messaging import send_text
 from ai_consultant_bot.openrouter import OpenRouterClient
@@ -130,11 +130,10 @@ async def process_next_job(
                         error_code=error_code,
                         status_code=status_code,
                     )
-        reply = result.reply if facts else missing_knowledge_reply(context["lead"], result.lead)
         with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
-                draft_id = save_consultation(connection, job, result.lead, reply)
+                draft_id = save_consultation(connection, job, result.lead, result.reply)
                 auto_reply = get_setting(connection, "auto_reply") == "1"
                 if draft_id is not None and (not auto_reply or context["source_type"] == "comment"):
                     finish_consultation_job(connection, job["id"], "done")
@@ -149,7 +148,7 @@ async def process_next_job(
                 settings,
                 umnico,
                 chat_id=job["chat_id"],
-                text=reply,
+                text=result.reply,
                 request_id=f"consultation:{job['id']}",
                 job_id=job["id"],
             )

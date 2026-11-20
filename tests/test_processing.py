@@ -66,7 +66,9 @@ def rows(settings: Settings, table: str) -> list[dict]:
         return [dict(row) for row in connection.execute(f"SELECT * FROM {table}").fetchall()]
 
 
-def completion(reply: str = "Придуманная цена 1 рубль", **lead: str | None) -> httpx.Response:
+def completion(
+    reply: str = "Здравствуйте! Какие размеры дивана вам нужны?", **lead: str | None
+) -> httpx.Response:
     return httpx.Response(
         200,
         json={
@@ -91,12 +93,22 @@ async def process(settings: Settings, handler, knowledge: KnowledgeBase | None =
         return await process_next_job(settings, knowledge, router, umnico)
 
 
-def test_draft_partial_lead_model_and_no_invented_facts(settings: Settings) -> None:
+@pytest.mark.parametrize("knowledge_state", ["missing", "empty", "unrelated"])
+def test_model_reply_and_partial_lead_without_matching_facts(
+    settings: Settings, knowledge_state: str
+) -> None:
+    if knowledge_state != "missing":
+        settings.knowledge_base_path.mkdir()
+    if knowledge_state == "unrelated":
+        (settings.knowledge_base_path / "care.txt").write_text(
+            "Уход: сухая чистка.", encoding="utf-8"
+        )
     ingest_event(settings, event())
     with open_database(settings.database_path, timeout=1) as connection, connection:
         save_lead(connection, 1, Lead(phone="+375290000000"))
         set_setting(connection, "model", "chosen/model")
     calls = []
+    reply = "Анна, здравствуйте! Какие размеры дивана и бюджет вы рассматриваете?"
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v1/chat/completions"
@@ -106,7 +118,7 @@ def test_draft_partial_lead_model_and_no_invented_facts(settings: Settings) -> N
         payload = json.loads(body["messages"][1]["content"])
         assert payload["knowledge"] == []
         assert payload["known_lead"]["phone"] == "+375290000000"
-        return completion(name="Анна", city="Минск", furniture_type="диван", phone=None)
+        return completion(reply, name="Анна", city="Минск", furniture_type="диван", phone=None)
 
     assert asyncio.run(process(settings, handler))
     assert not asyncio.run(process(settings, handler))
@@ -116,8 +128,7 @@ def test_draft_partial_lead_model_and_no_invented_facts(settings: Settings) -> N
     assert lead["name"] == "Анна" and lead["city"] == "Минск"
     assert lead["phone"] == "+375290000000" and lead["budget"] is None
     draft = rows(settings, "drafts")[0]
-    assert draft["status"] == "pending" and "1 рубль" not in draft["text"]
-    assert "Какие размеры" in draft["text"]
+    assert draft["status"] == "pending" and draft["text"] == reply
     assert rows(settings, "jobs")[0]["status"] == "done"
     assert rows(settings, "outgoing_attempts") == []
     assert rows(settings, "api_calls")[0]["service"] == "openrouter"
@@ -152,13 +163,15 @@ def test_auto_send_no_pause_and_no_retry(settings: Settings, outcome: str) -> No
         set_setting(connection, "auto_reply", "1")
     ingest_event(settings, event())
     calls = []
+    reply = "Анна, какие размеры дивана вам подойдут?"
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.path)
         if request.url.path.endswith("chat/completions"):
-            return completion(furniture_type="диван")
+            return completion(reply, furniture_type="диван")
         assert request.url.path == "/v2/messaging/456/messages"
         assert json.loads(request.content)["customId"] == "consultation:1"
+        assert json.loads(request.content)["message"]["text"] == reply
         if outcome == "unknown":
             raise httpx.ReadTimeout("private-timeout", request=request)
         return httpx.Response(400 if outcome == "failed" else 200, json=[{"messageId": "sent"}])
@@ -167,6 +180,7 @@ def test_auto_send_no_pause_and_no_retry(settings: Settings, outcome: str) -> No
     assert not asyncio.run(process(settings, handler))
     assert rows(settings, "chats")[0]["paused"] == 0
     assert rows(settings, "drafts")[0]["status"] == outcome
+    assert rows(settings, "drafts")[0]["text"] == reply
     assert rows(settings, "jobs")[0]["status"] == ("unknown" if outcome == "unknown" else "done")
     assert len(calls) == 2
     if outcome == "unknown":

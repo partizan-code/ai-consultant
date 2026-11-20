@@ -8,7 +8,6 @@ from ai_consultant_bot.api_http import APIError
 from ai_consultant_bot.config import Settings
 from ai_consultant_bot.consultation import (
     build_prompt,
-    missing_knowledge_reply,
     parse_consultation,
 )
 from ai_consultant_bot.knowledge import KnowledgeChunk
@@ -67,9 +66,21 @@ def test_partial_lead_and_data_are_not_promoted_to_system_instructions() -> None
     assert json.loads(prompt[1]["content"])["knowledge"][0]["text"] == "Диван Альфа."
 
 
-def test_missing_facts_reply_asks_only_for_unknown_fields() -> None:
-    reply = missing_knowledge_reply(
-        Lead(furniture_type="диван", dimensions="200 см"), Lead(budget="2000")
+def test_empty_knowledge_preserves_dialogue_context_and_fact_restrictions() -> None:
+    history = [{"direction": "incoming", "text": "Здравствуйте, нужен диван 200 см"}]
+    prompt = build_prompt(
+        history=history,
+        lead=Lead(furniture_type="диван", dimensions="200 см"),
+        post={},
+        source_type="message",
+        knowledge=[],
     )
-    assert "В каком вы городе?" in reply and "Когда планируете покупку?" in reply
-    assert "Какие размеры" not in reply and "бюджет" not in reply
+    payload = json.loads(prompt[1]["content"])
+    assert payload["knowledge"] == []
+    assert payload["history"] == history
+    assert payload["known_lead"]["dimensions"] == "200 см"
+    instruction = prompt[0]["content"]
+    assert "продолжай диалог" in instruction
+    assert "Не спрашивай повторно уже известные данные" in instruction
+    assert "бери только из knowledge" in instruction
+    assert "Не придумывай товары, условия, цены и обещания" in instruction

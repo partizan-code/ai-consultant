@@ -12,15 +12,23 @@ from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from loguru import logger
 from starlette.concurrency import run_in_threadpool
 
+from ai_consultant_bot.admin import (
+    chat_detail,
+    list_chats,
+    read_settings,
+    service_status,
+    set_pause,
+    update_settings,
+)
 from ai_consultant_bot.api_http import APIError
 from ai_consultant_bot.config import Settings
 from ai_consultant_bot.knowledge import KnowledgeBase
-from ai_consultant_bot.messaging import import_history, ingest_event, send_text
+from ai_consultant_bot.messaging import approve_draft, import_history, ingest_event, send_text
 from ai_consultant_bot.openrouter import OpenRouterClient
 from ai_consultant_bot.processing import run_worker
 from ai_consultant_bot.storage import initialize_database, open_database, recover_interrupted_jobs
@@ -98,6 +106,66 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/admin/settings", dependencies=[Depends(require_admin)])
+    def get_settings() -> dict[str, Any]:
+        return read_settings(settings)
+
+    @app.put("/admin/settings", dependencies=[Depends(require_admin)])
+    async def put_settings(request: Request) -> dict[str, Any]:
+        payload = await read_payload(request, settings.webhook_max_bytes)
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"model", "auto_reply"}
+            or not isinstance(payload["model"], str)
+            or type(payload["auto_reply"]) is not bool
+        ):
+            raise HTTPException(400, "Model and boolean auto_reply are required")
+        try:
+            return await run_in_threadpool(
+                update_settings, settings, payload["model"], payload["auto_reply"]
+            )
+        except ValueError:
+            raise HTTPException(400, "Invalid model identifier") from None
+
+    @app.get("/admin/chats", dependencies=[Depends(require_admin)])
+    def chats(offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
+        return list_chats(settings, offset)
+
+    @app.get("/admin/chats/{chat_id}", dependencies=[Depends(require_admin)])
+    def detail(chat_id: int, offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
+        try:
+            return chat_detail(settings, chat_id, offset)
+        except LookupError:
+            raise HTTPException(404, "Chat not found") from None
+
+    @app.post("/admin/chats/{chat_id}/pause", dependencies=[Depends(require_admin)])
+    async def pause(chat_id: int, request: Request) -> dict[str, bool]:
+        payload = await read_payload(request, settings.webhook_max_bytes)
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"paused"}
+            or type(payload["paused"]) is not bool
+        ):
+            raise HTTPException(400, "Boolean paused is required")
+        try:
+            return await run_in_threadpool(set_pause, settings, chat_id, payload["paused"])
+        except LookupError:
+            raise HTTPException(404, "Chat not found") from None
+
+    @app.post(
+        "/admin/chats/{chat_id}/drafts/{draft_id}/approve", dependencies=[Depends(require_admin)]
+    )
+    async def approve(chat_id: int, draft_id: int, request: Request) -> dict[str, Any]:
+        try:
+            result = await approve_draft(settings, request.app.state.umnico, chat_id, draft_id)
+        except LookupError:
+            raise HTTPException(404, "Draft not found") from None
+        return {key: result[key] for key in ("request_id", "status", "error_code")}
+
+    @app.get("/admin/status", dependencies=[Depends(require_admin)])
+    def status() -> dict[str, Any]:
+        return service_status(settings)
 
     @app.post("/admin/knowledge/reload", dependencies=[Depends(require_admin)])
     async def reload_knowledge(request: Request) -> dict[str, int]:
