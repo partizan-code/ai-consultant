@@ -60,7 +60,7 @@ class Settings:
     knowledge_max_chars: int = 50_000
     knowledge_max_documents: int = 100
     post_context_chars: int = 1500
-    consultation_reply_max_chars: int = 4000
+    consultation_reply_max_chars: int = 450
     lead_field_max_chars: int = 300
     panel_host: str = "127.0.0.1"
     panel_port: int = 8501

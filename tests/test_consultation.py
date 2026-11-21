@@ -109,3 +109,120 @@ def test_full_knowledge_prefix_is_stable_across_conversations() -> None:
     assert json.loads(first[1]["content"]) == {
         "knowledge": [{"source": "business.md", "text": text}]
     }
+
+
+@pytest.mark.parametrize("length", [450, 451])
+def test_reply_character_boundary(length: int) -> None:
+    raw = json.dumps({"reply": "я" * length, "lead": {}})
+    if length == 450:
+        assert len(parse_consultation(raw, [], Settings()).reply) == 450
+    else:
+        with pytest.raises(APIError, match="invalid_consultation_response"):
+            parse_consultation(raw, [], Settings())
+
+
+def test_configured_limits_are_shared_with_prompt_and_parser() -> None:
+    settings = Settings(consultation_reply_max_chars=120, lead_field_max_chars=80)
+    prompt = build_prompt(
+        history=[],
+        lead=Lead(),
+        post={},
+        source_type="message",
+        knowledge=[],
+        reply_max_chars=settings.consultation_reply_max_chars,
+        lead_field_max_chars=settings.lead_field_max_chars,
+    )
+    assert "до 120 символов" in prompt[0]["content"]
+    assert "до 80 символов" in prompt[0]["content"]
+    assert "__REPLY_MAX_CHARS__" not in prompt[0]["content"]
+    with pytest.raises(APIError):
+        parse_consultation(json.dumps({"reply": "x" * 121, "lead": {}}), [], settings)
+
+
+def test_characteristics_accumulate_from_verified_fragments_and_survive_history_limit() -> None:
+    history = [{"direction": "incoming", "text": "для ежедневного сна, с ящиком"}]
+    known = Lead(furniture_type="угловой диван")
+    raw = json.dumps(
+        {
+            "reply": "Какой размер нужен?",
+            "lead": {"furniture_type": {"append": ["для ежедневного сна", "с ящиком"]}},
+        }
+    )
+    result = parse_consultation(raw, history, Settings(), known_lead=known)
+    assert result.lead.furniture_type == "угловой диван; для ежедневного сна; с ящиком"
+    repeated = parse_consultation(raw, history, Settings(), known_lead=result.lead)
+    assert repeated.lead == result.lead
+
+
+def test_explicit_replacement_drops_superseded_characteristics() -> None:
+    history = [{"direction": "incoming", "text": "Теперь прямой диван, без спального места"}]
+    raw = json.dumps(
+        {
+            "reply": "Какой размер нужен?",
+            "lead": {"furniture_type": {"set": ["прямой диван", "без спального места"]}},
+        }
+    )
+    result = parse_consultation(
+        raw, history, Settings(), known_lead=Lead(furniture_type="угловой; для сна")
+    )
+    assert result.lead.furniture_type == "прямой диван; без спального места"
+
+
+def test_retraction_requires_a_separate_evidence_quote() -> None:
+    history = [{"direction": "incoming", "text": "Не используйте старый номер"}]
+    result = parse_consultation(
+        json.dumps(
+            {"reply": "Хорошо.", "lead": {"phone": {"clear": "Не используйте старый номер"}}}
+        ),
+        history,
+        Settings(),
+        known_lead=Lead(phone="+375290000000"),
+    )
+    assert result.cleared_fields == ("phone",)
+    assert result.lead.phone is None
+    unchanged = parse_consultation(
+        json.dumps({"reply": "Хорошо.", "lead": {"phone": None}}), history, Settings()
+    )
+    assert unchanged.cleared_fields == ()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("phone", {"append": ["номер"]}),
+        ("furniture_type", ["диван"]),
+        ("furniture_type", {"append": []}),
+        ("furniture_type", {"append": "диван"}),
+        ("furniture_type", {"append": ["диван", "велюр"]}),
+        ("furniture_type", {"set": [True]}),
+        ("furniture_type", {"set": ["диван"] * 9}),
+        ("furniture_type", {"set": ["диван"], "append": ["диван"]}),
+        ("furniture_type", {"unknown": ["диван"]}),
+        ("phone", {"clear": "отзываю номер"}),
+    ],
+)
+def test_structured_updates_reject_invalid_operations_and_unverified_quotes(field, value) -> None:
+    history = [
+        {"direction": "incoming", "text": "диван номер"},
+        {"direction": "outgoing", "text": "велюр отзываю номер"},
+    ]
+    with pytest.raises(APIError, match="invalid_consultation_response"):
+        parse_consultation(
+            json.dumps({"reply": "Хорошо.", "lead": {field: value}}), history, Settings()
+        )
+
+
+def test_accumulated_field_limit_is_checked_after_joining() -> None:
+    history = [{"direction": "incoming", "text": "для сна"}]
+    raw = json.dumps({"reply": "Хорошо.", "lead": {"furniture_type": {"append": ["для сна"]}}})
+    with pytest.raises(APIError, match="invalid_consultation_response"):
+        parse_consultation(
+            raw, history, Settings(lead_field_max_chars=10), known_lead=Lead(furniture_type="диван")
+        )
+
+
+def test_overlapping_dimension_quotes_are_not_discarded_as_duplicates() -> None:
+    history = [{"direction": "incoming", "text": "Глубина 60 см"}]
+    raw = json.dumps({"reply": "Хорошо.", "lead": {"dimensions": {"append": ["60 см"]}}})
+    result = parse_consultation(raw, history, Settings(), known_lead=Lead(dimensions="160 см"))
+    assert result.lead.dimensions == "160 см; 60 см"

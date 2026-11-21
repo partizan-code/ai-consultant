@@ -68,7 +68,7 @@ def rows(settings: Settings, table: str) -> list[dict]:
 
 
 def completion(
-    reply: str = "Здравствуйте! Какие размеры дивана вам нужны?", **lead: str | None
+    reply: str = "Здравствуйте! Какие размеры дивана вам нужны?", **lead: object
 ) -> httpx.Response:
     return httpx.Response(
         200,
@@ -596,3 +596,63 @@ def test_recovery_retries_requeued_suggestion_after_failed_send(settings: Settin
         assert recover_interrupted_jobs(connection) == 1
     asyncio.run(process(settings, lambda request: completion("Восстановленная подсказка")))
     assert rows(settings, "suggestions")[0]["text"] == "Восстановленная подсказка"
+
+
+def test_payment_memory_survives_bounded_history(settings: Settings) -> None:
+    settings = replace(settings, history_context_messages=1)
+    previous = event("old-offer", "Можно рассмотреть рассрочку.")
+    previous["type"] = "message.outgoing"
+    previous["message"]["incoming"] = False
+    ingest_event(settings, previous)
+    ingest_event(settings, event("new-incoming", "Всё ещё дорого"))
+
+    def handler(request):
+        payload = json.loads(json.loads(request.content)["messages"][2]["content"])
+        assert payload["history"] == [{"direction": "incoming", "text": "Всё ещё дорого"}]
+        assert payload["dialogue_state"]["payment_options_mentioned"] is True
+        return completion("Какой бюджет вы рассматриваете?")
+
+    asyncio.run(process(settings, handler))
+
+
+def test_characteristics_and_retraction_flow_through_processing(settings: Settings) -> None:
+    ingest_event(settings, event("first", "угловой диван"))
+    asyncio.run(process(settings, lambda request: completion(furniture_type="угловой диван")))
+    with open_database(settings.database_path, timeout=1) as connection, connection:
+        save_lead(connection, 1, Lead(phone="old"))
+    ingest_event(settings, event("second", "для ежедневного сна. Не используйте старый номер"))
+
+    def handler(request):
+        return completion(
+            "Какой размер нужен?",
+            furniture_type={"append": ["для ежедневного сна"]},
+            phone={"clear": "Не используйте старый номер"},
+        )
+
+    asyncio.run(process(settings, handler))
+    lead = rows(settings, "leads")[0]
+    assert lead["furniture_type"] == "угловой диван; для ежедневного сна"
+    assert lead["phone"] is None
+
+
+def test_stale_retraction_cannot_clear_a_lead(settings: Settings) -> None:
+    ingest_event(settings, event(text="Не используйте старый номер"))
+    with open_database(settings.database_path, timeout=1) as connection, connection:
+        save_lead(connection, 1, Lead(phone="old"))
+
+    def handler(request):
+        ingest_event(settings, event("newer", "Оставьте прежний номер"))
+        return completion("Хорошо.", phone={"clear": "Не используйте старый номер"})
+
+    asyncio.run(process(settings, handler))
+    assert rows(settings, "leads")[0]["phone"] == "old"
+    assert not rows(settings, "suggestions")
+
+
+def test_overlong_model_reply_is_not_saved_or_sent(settings: Settings) -> None:
+    ingest_event(settings, event())
+    with pytest.raises(APIError, match="invalid_consultation_response"):
+        asyncio.run(process(settings, lambda request: completion("я" * 451, name="Анна")))
+    assert not rows(settings, "leads")
+    assert not rows(settings, "suggestions")
+    assert not rows(settings, "outgoing_attempts")

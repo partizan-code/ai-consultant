@@ -245,8 +245,25 @@ def save_message(
     return cursor.rowcount == 1
 
 
-def save_lead(connection: sqlite3.Connection, chat_id: int, lead: Lead) -> None:
-    """Merge known fields, preserving existing data when a partial update omits it."""
+def save_lead(
+    connection: sqlite3.Connection,
+    chat_id: int,
+    lead: Lead,
+    *,
+    cleared_fields: tuple[str, ...] = (),
+) -> None:
+    """Merge updates; explicit retractions clear every route of this conversation."""
+    values = asdict(lead)
+    if any(field not in values or values[field] is not None for field in cleared_fields):
+        raise ValueError("Invalid lead field retraction")
+    if cleared_fields:
+        member_ids = conversation_chat_ids(connection, chat_id)
+        placeholders = ",".join("?" for _ in member_ids)
+        # Column names come only from the validated Lead fields above.
+        assignments = ", ".join(f"{field} = NULL" for field in dict.fromkeys(cleared_fields))
+        connection.execute(
+            f"UPDATE leads SET {assignments} WHERE chat_id IN ({placeholders})", member_ids
+        )
     connection.execute(
         "INSERT INTO leads(chat_id, name, phone, furniture_type, dimensions, budget, city, "
         "purchase_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET "
@@ -518,17 +535,48 @@ def load_consultation_context(
         if post
         else {},
         "model": get_setting(connection, "model"),
+        "dialogue_state": {
+            "payment_options_mentioned": payment_options_mentioned(connection, job["chat_id"])
+        },
     }
 
 
+def payment_options_mentioned(connection: sqlite3.Connection, chat_id: int) -> bool:
+    """Inspect durable outgoing text, independently of the bounded model history.
+
+    Uncertain sends count conservatively; drafts and failed/blocked sends do not.
+    This detects payment terminology, not the semantic intent of every paraphrase.
+    """
+    member_ids = conversation_chat_ids(connection, chat_id)
+    placeholders = ",".join("?" for _ in member_ids)
+    rows = connection.execute(
+        f"SELECT text FROM messages WHERE chat_id IN ({placeholders}) AND direction = 'outgoing' "
+        f"UNION ALL SELECT text FROM outgoing_attempts WHERE chat_id IN ({placeholders}) "
+        "AND status IN ('sent', 'unknown')",
+        (*member_ids, *member_ids),
+    )
+    try:
+        return any(
+            any(term in row["text"].casefold() for term in ("рассроч", "кредит", "частями"))
+            for row in rows
+        )
+    finally:
+        rows.close()
+
+
 def save_consultation(
-    connection: sqlite3.Connection, job: sqlite3.Row, lead: Lead, reply: str
+    connection: sqlite3.Connection,
+    job: sqlite3.Row,
+    lead: Lead,
+    reply: str,
+    *,
+    cleared_fields: tuple[str, ...] = (),
 ) -> bool | None:
     """Return paused state, or None for stale work. Caller holds BEGIN IMMEDIATE."""
     if not consultation_is_current(connection, job["id"], job["generation"]):
         finish_consultation_job(connection, job["id"], "done", job["generation"])
         return None
-    save_lead(connection, job["chat_id"], lead)
+    save_lead(connection, job["chat_id"], lead, cleared_fields=cleared_fields)
     member_ids = conversation_chat_ids(connection, job["chat_id"])
     placeholders = ",".join("?" for _ in member_ids)
     paused = bool(

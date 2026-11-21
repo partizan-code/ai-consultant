@@ -71,10 +71,18 @@ async def process_next_job(
         error_code, status_code = None, None
         try:
             raw = await openrouter.complete(
-                build_prompt(**context, knowledge=documents), model=model
+                build_prompt(
+                    **context,
+                    knowledge=documents,
+                    reply_max_chars=settings.consultation_reply_max_chars,
+                    lead_field_max_chars=settings.lead_field_max_chars,
+                ),
+                model=model,
             )
             status_code = 200
-            result = parse_consultation(raw, context["history"], settings)
+            result = parse_consultation(
+                raw, context["history"], settings, known_lead=context["lead"]
+            )
         except APIError as error:
             error_code = error.code
             if error.status_code is not None:
@@ -99,7 +107,13 @@ async def process_next_job(
         with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
-                paused = save_consultation(connection, job, result.lead, result.reply)
+                paused = save_consultation(
+                    connection,
+                    job,
+                    result.lead,
+                    result.reply,
+                    cleared_fields=result.cleared_fields,
+                )
                 if paused is not None and (paused or context["source_type"] == "comment"):
                     finish_consultation_job(connection, job["id"], "done", job["generation"])
         if paused is None:

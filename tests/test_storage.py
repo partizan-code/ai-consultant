@@ -9,9 +9,11 @@ from ai_consultant_bot.config import Settings
 from ai_consultant_bot.storage import (
     ChatKey,
     Lead,
+    get_conversation_lead,
     get_setting,
     initialize_database,
     open_database,
+    payment_options_mentioned,
     save_chat,
     save_lead,
     save_message,
@@ -77,3 +79,73 @@ def test_transaction_rollback(tmp_path: Path) -> None:
             save_chat(connection, ChatKey("a", "l", "i", "message", "s"))
             raise RuntimeError("Simulated processing failure")
         assert connection.execute("SELECT COUNT(*) FROM chats").fetchone()[0] == 0
+
+
+def test_retracted_field_cannot_resurface_from_another_route(tmp_path: Path) -> None:
+    with open_database(tmp_path / "test.sqlite3", timeout=1) as connection:
+        initialize_database(connection, Settings())
+        with connection:
+            key = ChatKey("a", "l", "i", "message", "s")
+            direct = save_chat(connection, key)
+            comment = save_chat(connection, replace(key, source_type="comment"))
+            other = save_chat(connection, replace(key, lead_id="other"))
+            save_lead(connection, direct, Lead(phone="old", name="Анна"))
+            save_lead(connection, comment, Lead(phone="new"))
+            save_lead(connection, other, Lead(phone="unrelated"))
+            save_lead(connection, comment, Lead(), cleared_fields=("phone",))
+        assert get_conversation_lead(connection, direct).phone is None
+        assert get_conversation_lead(connection, comment).phone is None
+        assert get_conversation_lead(connection, direct).name == "Анна"
+        assert get_conversation_lead(connection, other).phone == "unrelated"
+        with connection:
+            save_lead(connection, direct, Lead(city="Минск"))
+        assert get_conversation_lead(connection, direct).phone is None
+
+
+@pytest.mark.parametrize(
+    "field,lead",
+    [
+        ("phone", Lead(phone="new")),
+        ("not_a_field", Lead()),
+        ("phone = NULL; DELETE FROM leads", Lead()),
+    ],
+)
+def test_invalid_retractions_do_not_change_existing_data(tmp_path: Path, field, lead) -> None:
+    with open_database(tmp_path / "test.sqlite3", timeout=1) as connection:
+        initialize_database(connection, Settings())
+        with connection:
+            chat_id = save_chat(connection, ChatKey("a", "l", "i", "message", "s"))
+            save_lead(connection, chat_id, Lead(phone="old"))
+        with pytest.raises(ValueError), connection:
+            save_lead(connection, chat_id, lead, cleared_fields=(field,))
+        assert get_conversation_lead(connection, chat_id).phone == "old"
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [
+        ("sent", True),
+        ("unknown", True),
+        ("failed", False),
+        ("blocked", False),
+    ],
+)
+def test_payment_memory_counts_only_sent_or_uncertain_attempts(
+    tmp_path: Path, status, expected
+) -> None:
+    path = tmp_path / "test.sqlite3"
+    with open_database(path, timeout=1) as connection:
+        initialize_database(connection, Settings())
+        with connection:
+            key = ChatKey("a", "l", "i", "message", "s")
+            chat_id = save_chat(connection, key)
+            comment = save_chat(connection, replace(key, source_type="comment"))
+            unrelated = save_chat(connection, replace(key, integration_id="other"))
+            connection.execute(
+                "INSERT INTO outgoing_attempts(request_id, chat_id, text, status) VALUES (?, ?, ?, ?)",
+                ("offer", chat_id, "Есть РАССРОЧКА.", status),
+            )
+    with open_database(path, timeout=1) as connection:
+        assert payment_options_mentioned(connection, chat_id) is expected
+        assert payment_options_mentioned(connection, comment) is expected
+        assert not payment_options_mentioned(connection, unrelated)
