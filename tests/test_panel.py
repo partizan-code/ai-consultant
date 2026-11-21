@@ -24,6 +24,7 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         attempts=[],
         calls=[],
         comment=False,
+        reply_chat_id=None,
         failure=False,
         outcome="sent",
         messages=[],
@@ -58,7 +59,14 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             }
         if path in {"chats/1", "chats/2"}:
             return {
-                "chat": {"paused": state.paused},
+                "chat": {
+                    "paused": state.paused,
+                    "instagram_username": next(
+                        chat.get("instagram_username")
+                        for chat in state.chats
+                        if chat["id"] == int(path.rsplit("/", 1)[1])
+                    ),
+                },
                 "lead": {
                     key: None
                     for key in (
@@ -76,6 +84,7 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
                 "drafts": state.drafts,
                 "attempts": state.attempts,
                 "reply_block_reason": "comment_private_reply_unverified" if state.comment else None,
+                "reply_chat_id": state.reply_chat_id,
             }
         if path == "chats/1/pause":
             state.paused = payload["paused"]
@@ -133,9 +142,15 @@ def test_panel_settings_status_and_reload(backend: SimpleNamespace) -> None:
 
 def test_panel_pause_and_approve(backend: SimpleNamespace) -> None:
     app = panel()
-    button(app, "Пауза бота").click().run()
+    assert app.toggle(key="bot_active_1").value
+    app.toggle(key="bot_active_1").set_value(False).run()
     assert backend.paused and button(app, "Одобрить и отправить").disabled
-    button(app, "Возобновить бота").click().run()
+    app.toggle(key="bot_active_1").set_value(True).run()
+    assert app.toggle(key="bot_active_1").value and not backend.paused
+    assert [payload for method, path, payload in backend.calls if path == "chats/1/pause"] == [
+        {"paused": True},
+        {"paused": False},
+    ]
     button(app, "Одобрить и отправить").click().run()
     assert backend.drafts[0]["status"] == "sent" and not backend.paused
     assert not app.exception and len(app.success) == 1
@@ -146,6 +161,7 @@ def test_panel_manual_reply_and_refresh_do_not_resend(backend: SimpleNamespace) 
     app.text_area[0].set_value("Здравствуйте")
     button(app, "Отправить ответ").click().run()
     assert backend.paused and backend.drafts[0]["status"] == "stale"
+    assert not app.toggle(key="bot_active_1").value
     assert len(backend.attempts) == 1
     button(app, "Обновить данные").click().run()
     assert len(backend.attempts) == 1 and not app.exception
@@ -308,6 +324,29 @@ def test_timer_updates_chat_without_redrawing_form_or_sending(
     assert not backend.attempts
 
 
+def test_scroll_initialization_changes_on_full_refresh_but_not_timer(
+    backend: SimpleNamespace, timer: SimpleNamespace
+) -> None:
+    def scroll_script(app):
+        scripts = [item for item in app.html if item.proto.unsafe_allow_javascript]
+        assert len(scripts) == 1
+        return scripts[0].value
+
+    app = panel()
+    first = scroll_script(app)
+    assert 'const view = "1:0:1"' in first
+    button(app, "Обновить данные").click().run()
+    refreshed = scroll_script(app)
+    assert not app.exception and 'const view = "1:0:2"' in refreshed
+    timer.active = True
+    app.run()
+    assert not app.exception and scroll_script(app) == refreshed
+    timer.active = False
+    app.run()
+    assert not app.exception and 'const view = "1:0:3"' in scroll_script(app)
+    assert all(method == "GET" for method, _, _ in backend.calls)
+
+
 def test_chat_tabs_open_only_selected_chat_and_keep_selection(backend: SimpleNamespace) -> None:
     backend.chats.append({**backend.chats[0], "id": 2, "name": "Борис"})
     app = panel()
@@ -349,7 +388,16 @@ def test_chat_title_uses_login_instead_of_account_or_lead_name(
     app = panel()
     assert not app.exception
     assert app.button(key="chat_tab_1").label == f"{title} · #1"
-    assert title in [item.value for item in app.subheader]
+    assert title not in [item.value for item in app.subheader]
+    card = app.main.get_by_key("client_card")
+    assert card.caption[0].value == "Instagram"
+    if username:
+        assert len(card.html) == 1
+        assert f'href="https://www.instagram.com/{username}/"' in card.html[0].value
+        assert f">{username}</a>" in card.html[0].value
+    else:
+        assert not card.html and card.text[0].value == "—"
+    assert not any("Переписка обновляется" in item.value for item in app.caption)
     assert "Анна" not in [item.value for item in app.subheader]
     assert "Старое имя аккаунта" not in [item.value for item in app.subheader]
 
@@ -384,7 +432,10 @@ def test_message_time_format(timestamp: str, expected: str) -> None:
     assert format_message_time(timestamp) == expected
 
 
-def test_compact_messages_keep_text_context_and_import_marker(backend: SimpleNamespace) -> None:
+@pytest.mark.parametrize("photo", [None, "https://example.test/photo.jpg"])
+def test_compact_messages_keep_text_context_and_import_marker(
+    backend: SimpleNamespace, photo: str | None
+) -> None:
     backend.messages = [
         {
             "direction": "incoming",
@@ -394,6 +445,7 @@ def test_compact_messages_keep_text_context_and_import_marker(backend: SimpleNam
             "post_url": "https://example.test/post",
             "post_description": "Описание поста",
             "post_owner": "Автор",
+            "post_photo_url": photo,
         },
         {
             "direction": "outgoing",
@@ -416,6 +468,28 @@ def test_compact_messages_keep_text_context_and_import_marker(backend: SimpleNam
         "Автор поста: Автор",
     ]
     assert app.chat_message[1].text[0].value == "[Сообщение без текста]"
+    images = app.chat_message[0].get("image")
+    assert len(images) == (1 if photo else 0)
+    if photo:
+        assert images[0].proto.imgs[0].url == photo
+    assert not app.chat_message[1].get("image")
+
+
+def test_grouped_chat_uses_direct_route_and_keeps_comment_draft_blocked(
+    backend: SimpleNamespace,
+) -> None:
+    backend.reply_chat_id = 2  # The first event was a comment, Direct arrived later.
+    backend.chats[0]["source_types"] = "comment,message"
+    backend.drafts[0].update(chat_id=1, source_type="comment")
+    app = panel()
+    assert not app.exception and button(app, "Одобрить и отправить").disabled
+    assert not button(app, "Отправить ответ").disabled
+    app.text_area[0].set_value("Ответ в существующий Direct")
+    button(app, "Отправить ответ").click().run()
+    assert not app.exception
+    sends = [path for method, path, _ in backend.calls if method == "POST"]
+    assert sends == ["chats/2/send-text"]
+    assert len(backend.attempts) == 1
 
 
 def test_timer_recovers_from_backend_error(
@@ -430,5 +504,5 @@ def test_timer_recovers_from_backend_error(
     backend.paused = True
     app.run()
     assert not app.exception and not app.error
-    assert any(item.value == "Бот на паузе" for item in app.caption)
+    assert not app.toggle(key="bot_active_1").value
     assert all(method == "GET" for method, _, _ in backend.calls)

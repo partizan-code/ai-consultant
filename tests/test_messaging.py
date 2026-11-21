@@ -73,6 +73,7 @@ def rows(settings: Settings, table: str) -> list[dict]:
         "outgoing_attempts",
         "outgoing_receipts",
         "chat_profiles",
+        "message_previews",
     }
     with open_database(settings.database_path, timeout=1) as connection:
         return [dict(row) for row in connection.execute(f"SELECT * FROM {table}")]
@@ -104,6 +105,66 @@ def test_comment_without_preview_and_with_post_context(preview: dict | None) -> 
     assert parsed.text == "Нужен диван"
     assert parsed.post_url == "https://example.org/post"
     assert parsed.post_description == (preview["description"] if preview else None)
+
+
+def test_photo_preview_is_retained_on_ingestion_history_and_replay(settings: Settings) -> None:
+    event = incoming(source_type="comment")
+    assert ingest_event(settings, event) == "saved"
+    event["message"]["preview"] = {"photo": "https://example.test/post.jpg"}
+    assert ingest_event(settings, event) == "duplicate"
+    assert rows(settings, "message_previews") == [
+        {"message_id": 1, "photo_url": "https://example.test/post.jpg"}
+    ]
+    event["message"]["preview"] = None
+    assert ingest_event(settings, event) == "duplicate"
+    assert len(rows(settings, "messages")) == len(rows(settings, "jobs")) == 1
+    assert rows(settings, "message_previews")[0]["photo_url"].endswith("post.jpg")
+    ingest_event(settings, incoming("direct"))
+    old = history_message("old-photo")
+    old["preview"] = {"photo": "https://example.test/history.jpg"}
+
+    def handler(request):
+        first = not json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "source": 255 if first else 0,
+                "cursor": 1 if first else 0,
+                "messages": [old] if first else [],
+            },
+        )
+
+    async def run():
+        async with UmnicoClient(settings, transport=httpx.MockTransport(handler)) as client:
+            assert await import_history(settings, client, 2) == 1
+            assert await import_history(settings, client, 2) == 0
+
+    asyncio.run(run())
+    assert len(rows(settings, "jobs")) == 2  # Import/replay never queues an extra reply.
+    assert rows(settings, "message_previews")[-1]["photo_url"].endswith("history.jpg")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        {},
+        123,
+        "",
+        "C:/private/photo.jpg",
+        "file:///etc/passwd",
+        "//host/photo.jpg",
+        "https://user:password@example.test/image",
+        "https://:password@example.test/image",
+        "https://[broken",
+        "https://host/a\nb",
+    ],
+)
+def test_invalid_photo_never_rejects_comment_or_loads_local_file(value: object) -> None:
+    event = incoming(source_type="comment")
+    event["message"]["preview"] = {"photo": value}
+    parsed = parse_event(event)
+    assert parsed is not None and parsed.post_photo_url is None
 
 
 @pytest.mark.parametrize("source_type", ["message", "comment"])

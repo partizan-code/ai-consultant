@@ -28,7 +28,12 @@ from ai_consultant_bot.admin import (
 from ai_consultant_bot.api_http import APIError
 from ai_consultant_bot.config import Settings
 from ai_consultant_bot.knowledge import KnowledgeBase
-from ai_consultant_bot.messaging import approve_draft, import_history, ingest_event, send_text
+from ai_consultant_bot.messaging import (
+    approve_draft,
+    import_conversation_history,
+    ingest_event,
+    send_text,
+)
 from ai_consultant_bot.openrouter import OpenRouterClient
 from ai_consultant_bot.processing import run_worker
 from ai_consultant_bot.storage import initialize_database, open_database, recover_interrupted_jobs
@@ -204,7 +209,11 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
     @app.post("/admin/chats/{chat_id}/import-history", dependencies=[Depends(require_admin)])
     async def history(chat_id: int, request: Request) -> dict[str, int]:
         try:
-            return {"imported": await import_history(settings, request.app.state.umnico, chat_id)}
+            return {
+                "imported": await import_conversation_history(
+                    settings, request.app.state.umnico, chat_id
+                )
+            }
         except LookupError:
             raise HTTPException(404, "Chat not found") from None
 

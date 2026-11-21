@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 from ai_consultant_bot.storage import ChatKey
 
@@ -24,6 +25,7 @@ class MessageEvent:
     post_owner: str | None = None
     custom_id: str | None = None
     instagram_username: str | None = None
+    post_photo_url: str | None = None
 
 
 def identifier(value: Any) -> str:
@@ -37,6 +39,24 @@ def identifier(value: Any) -> str:
 
 def optional_text(value: Any) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
+
+
+def photo_url(value: Any) -> str | None:
+    """Only browser-loadable HTTP images; never pass local paths to Streamlit."""
+    if not isinstance(value, str) or any(char.isspace() for char in value):
+        return None
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+        ):
+            return value
+    except ValueError:
+        pass
+    return None
 
 
 def instagram_username(sender: dict[str, Any], integration: dict[str, Any]) -> str | None:
@@ -106,6 +126,7 @@ def parse_message(account_id: Any, lead_id: Any, message: Any) -> MessageEvent:
                 else None
             ),
             instagram_username=instagram_username(sender, integration) if incoming else None,
+            post_photo_url=photo_url(preview.get("photo")),
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         raise ValueError("Invalid Umnico message") from None

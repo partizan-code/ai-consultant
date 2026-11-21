@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from ai_consultant_bot.admin import chat_detail, set_pause
+from ai_consultant_bot.admin import chat_detail, list_chats, set_pause
 from ai_consultant_bot.config import Settings
 from ai_consultant_bot.knowledge import KnowledgeBase
 from ai_consultant_bot.messaging import ingest_event
@@ -426,3 +426,145 @@ def test_manual_cannot_claim_internal_request_namespace(settings: Settings) -> N
             assert chat_detail(settings, 1)["attempts"] == []
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("comment_first", [False, True])
+def test_one_conversation_keeps_routes_and_sends_manual_reply_in_direct(
+    settings: Settings, comment_first: bool
+) -> None:
+    first_source, second_source = (
+        ("comment", "message") if comment_first else ("message", "comment")
+    )
+    make_draft(settings, first_source)
+    second = event("second", second_source)
+    second["message"]["source"].update(id="second-source", realId=256)
+    second["message"]["datetime"] = "2026-11-20T10:01:00Z"
+    second["message"]["sender"] = {"login": "customer", "type": "instagramV3"}
+    second["message"]["preview"]["photo"] = "https://example.test/photo.jpg"
+    ingest_event(settings, second)
+    with open_database(settings.database_path, timeout=1) as connection, connection:
+        connection.execute(
+            "INSERT INTO drafts(chat_id, message_id, text) VALUES (2, 2, 'Новый ответ')"
+        )
+        save_lead(connection, 2, Lead(city="Минск"))
+    listing = list_chats(settings)
+    assert listing["total"] == 1
+    item = listing["items"][0]
+    assert item["id"] == 1 and item["instagram_username"] == "customer"
+    assert item["pending_drafts"] == 1
+    assert set(item["source_types"].split(",")) == {"message", "comment"}
+    detail = chat_detail(settings, 1)
+    assert detail == chat_detail(settings, 2)  # Old source links open the same conversation.
+    assert detail["message_total"] == 2
+    assert [row["external_id"] for row in detail["messages"]] == ["first", "second"]
+    assert detail["messages"][1]["post_photo_url"] == "https://example.test/photo.jpg"
+    assert detail["lead"]["name"] == "Анна" and detail["lead"]["city"] == "Минск"
+    direct_id = 2 if comment_first else 1
+    assert detail["reply_chat_id"] == direct_id and detail["reply_block_reason"] is None
+    sent = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["source"] == (256 if comment_first else 255)
+        sent.append(body)
+        return httpx.Response(200, json=[{"messageId": "sent"}])
+
+    async def run():
+        async with api(settings, handler) as client:
+            result = await client.post(
+                f"/admin/chats/{direct_id}/send-text",
+                headers=HEADERS,
+                json={"request_id": "manual", "text": "Ответ в Direct"},
+            )
+            assert result.status_code == 200 and result.json()["status"] == "sent"
+
+    asyncio.run(run())
+    assert len(sent) == 1
+    detail = chat_detail(settings, 1)
+    assert detail["attempts"][0]["chat_id"] == direct_id
+    assert all(draft["status"] == "stale" for draft in detail["drafts"])
+    with open_database(settings.database_path, timeout=1) as connection:
+        assert [row[0] for row in connection.execute("SELECT paused FROM chats")] == [1, 1]
+        assert {row[0] for row in connection.execute("SELECT status FROM jobs")} == {"done"}
+
+
+@pytest.mark.parametrize("boundary", ["accountId", "leadId", "integration"])
+def test_same_login_does_not_merge_different_customers_or_integrations(
+    settings: Settings, boundary: str
+) -> None:
+    first = event()
+    first["message"]["sender"] = {"login": "same_login", "type": "instagramV3"}
+    ingest_event(settings, first)
+    second = event("second", "comment")
+    second["message"]["sender"] = first["message"]["sender"]
+    if boundary == "integration":
+        second["message"]["sa"]["id"] = 99
+    else:
+        second[boundary] = 999
+    ingest_event(settings, second)
+    paged = replace(settings, panel_page_size=1)
+    assert list_chats(paged)["total"] == 2
+    assert len(list_chats(paged)["items"]) == len(list_chats(paged, 1)["items"]) == 1
+    assert chat_detail(settings, 1)["message_total"] == 1
+    assert chat_detail(settings, 2)["reply_chat_id"] is None
+
+
+def test_conversation_pause_applies_to_existing_and_future_sources(settings: Settings) -> None:
+    ingest_event(settings, event())
+    set_pause(settings, 1, True)
+    ingest_event(settings, event("comment", "comment"))
+    with open_database(settings.database_path, timeout=1) as connection:
+        assert [row[0] for row in connection.execute("SELECT paused FROM chats")] == [1, 1]
+    set_pause(settings, 2, False)
+    with open_database(settings.database_path, timeout=1) as connection:
+        assert [row[0] for row in connection.execute("SELECT paused FROM chats")] == [0, 0]
+
+
+def test_multiple_direct_routes_require_explicit_selection(settings: Settings) -> None:
+    ingest_event(settings, event())
+    second = event("second")
+    second["message"]["source"]["id"] = "another-direct"
+    ingest_event(settings, second)
+    assert list_chats(settings)["total"] == 1
+    detail = chat_detail(settings, 1)
+    assert detail["reply_chat_id"] is None
+    assert detail["reply_block_reason"] == "ambiguous_direct_route"
+
+
+def test_import_enriches_old_comment_photo_in_combined_conversation(settings: Settings) -> None:
+    direct = event()
+    comment = event("comment", "comment")
+    comment["message"]["source"].update(id="comment-source", realId=256)
+    ingest_event(settings, direct)
+    ingest_event(settings, comment)
+    by_source = {255: direct["message"], 256: comment["message"]}
+    for message in by_source.values():
+        message["sentAt"] = message.pop("datetime")
+    comment["message"]["preview"]["photo"] = "https://example.test/old-post.jpg"
+    requested = []
+
+    def handler(request):
+        source = int(request.url.path.rsplit("/", 1)[1])
+        requested.append(source)
+        first = not json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "source": source if first else 0,
+                "cursor": 1 if first else 0,
+                "messages": [by_source[source]] if first else [],
+            },
+        )
+
+    async def run():
+        async with api(settings, handler) as client:
+            response = await client.post("/admin/chats/1/import-history", headers=HEADERS)
+            assert response.status_code == 200 and response.json() == {"imported": 0}
+
+    asyncio.run(run())
+    assert requested == [255, 255, 256, 256]
+    detail = chat_detail(settings, 1)
+    assert detail["message_total"] == 2
+    assert detail["messages"][1]["post_photo_url"] == "https://example.test/old-post.jpg"
+    with open_database(settings.database_path, timeout=1) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 2

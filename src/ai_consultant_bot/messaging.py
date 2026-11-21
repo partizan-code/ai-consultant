@@ -13,6 +13,7 @@ from ai_consultant_bot.events import parse_event, parse_history_message
 from ai_consultant_bot.storage import (
     cancel_generation,
     consultation_is_current,
+    conversation_chat_ids,
     get_setting,
     open_database,
     reconcile_outgoing_attempt,
@@ -103,6 +104,18 @@ async def resolve_chat_route(
             raise APIError("umnico", "ambiguous_source_real_id")
         route["source_real_id"] = matches.pop()
     return route
+
+
+async def import_conversation_history(
+    settings: Settings, client: UmnicoClient, chat_id: int
+) -> int:
+    """Import each preserved source, also backfilling previews on duplicate messages."""
+    with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
+        member_ids = conversation_chat_ids(connection, chat_id)
+    count = 0
+    for member_id in member_ids:
+        count += await import_history(settings, client, member_id)
+    return count
 
 
 async def import_history(settings: Settings, client: UmnicoClient, chat_id: int) -> int:
@@ -212,8 +225,12 @@ async def send_text(
             if previous["chat_id"] != chat_id or previous["text"] != text:
                 raise ValueError("Request ID already used with different content")
             return dict(previous)
+        member_ids = conversation_chat_ids(connection, chat_id)
+        placeholders = ",".join("?" for _ in member_ids)
         if connection.execute(
-            "SELECT 1 FROM outgoing_attempts WHERE chat_id = ? AND status = 'unknown'", (chat_id,)
+            f"SELECT 1 FROM outgoing_attempts WHERE chat_id IN ({placeholders}) "
+            "AND status = 'unknown'",
+            member_ids,
         ).fetchone():
             raise APIError("umnico", "unresolved_send")
     route = get_chat_route(settings, chat_id)
@@ -232,6 +249,8 @@ async def send_text(
     with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
         with connection:
             connection.execute("BEGIN IMMEDIATE")
+            member_ids = conversation_chat_ids(connection, chat_id)
+            placeholders = ",".join("?" for _ in member_ids)
             reconcile_outgoing_attempt(connection, request_id)
             previous = connection.execute(
                 "SELECT * FROM outgoing_attempts WHERE request_id = ?",
@@ -242,23 +261,29 @@ async def send_text(
                     raise ValueError("Request ID already used with different content")
                 return dict(previous)
             if connection.execute(
-                "SELECT 1 FROM outgoing_attempts WHERE chat_id = ? AND status = 'unknown'",
-                (chat_id,),
+                f"SELECT 1 FROM outgoing_attempts WHERE chat_id IN ({placeholders}) "
+                "AND status = 'unknown'",
+                member_ids,
             ).fetchone():
                 raise APIError("umnico", "unresolved_send")
             if (job_id is not None or draft_id is not None) and connection.execute(
                 "SELECT 1 FROM jobs j JOIN messages m ON m.id = j.message_id "
-                "WHERE m.chat_id = ? AND j.status IN ('processing', 'unknown') "
+                f"WHERE m.chat_id IN ({placeholders}) AND j.status IN ('processing', 'unknown') "
                 "AND (? IS NULL OR j.id != ?)",
-                (chat_id, job_id, job_id),
+                (*member_ids, job_id, job_id),
             ).fetchone():
                 raise APIError("umnico", "chat_processing")
             if draft_id is not None:
                 current = connection.execute(
                     "SELECT 1 FROM drafts d JOIN chats c ON c.id = d.chat_id "
                     "WHERE d.id = ? AND d.chat_id = ? AND d.text = ? AND d.status = 'pending' "
-                    "AND c.paused = 0 AND NOT EXISTS (SELECT 1 FROM messages newer "
-                    "WHERE newer.chat_id = c.id AND newer.direction = 'incoming' "
+                    "AND c.paused = 0 AND NOT EXISTS (SELECT 1 FROM chats pc "
+                    "WHERE pc.account_id = c.account_id AND pc.lead_id = c.lead_id "
+                    "AND pc.integration_id = c.integration_id AND pc.paused = 1) "
+                    "AND NOT EXISTS (SELECT 1 FROM messages newer "
+                    "JOIN chats nc ON nc.id = newer.chat_id "
+                    "WHERE nc.account_id = c.account_id AND nc.lead_id = c.lead_id "
+                    "AND nc.integration_id = c.integration_id AND newer.direction = 'incoming' "
                     "AND newer.imported = 0 AND newer.id > d.message_id)",
                     (draft_id, chat_id, text),
                 ).fetchone()
@@ -282,18 +307,19 @@ async def send_text(
             if not blocked and draft_id is not None:
                 connection.execute("UPDATE drafts SET status = 'unknown' WHERE id = ?", (draft_id,))
             if not blocked and job_id is None and draft_id is None:
-                connection.execute("UPDATE chats SET paused = 1 WHERE id = ?", (chat_id,))
-                cancel_generation(connection, chat_id)
-                connection.execute(
-                    "UPDATE jobs SET status = 'done' WHERE status = 'pending' "
-                    "AND message_id IN (SELECT id FROM messages WHERE chat_id = ?)",
-                    (chat_id,),
-                )
-                connection.execute(
-                    "UPDATE drafts SET status = 'stale' WHERE chat_id = ? "
-                    "AND status IN ('pending', 'approved')",
-                    (chat_id,),
-                )
+                for member_id in conversation_chat_ids(connection, chat_id):
+                    connection.execute("UPDATE chats SET paused = 1 WHERE id = ?", (member_id,))
+                    cancel_generation(connection, member_id)
+                    connection.execute(
+                        "UPDATE jobs SET status = 'done' WHERE status = 'pending' "
+                        "AND message_id IN (SELECT id FROM messages WHERE chat_id = ?)",
+                        (member_id,),
+                    )
+                    connection.execute(
+                        "UPDATE drafts SET status = 'stale' WHERE chat_id = ? "
+                        "AND status IN ('pending', 'approved')",
+                        (member_id,),
+                    )
             if not blocked:
                 reconcile_outgoing_attempt(connection, request_id)
                 confirmed = connection.execute(

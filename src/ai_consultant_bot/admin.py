@@ -8,11 +8,19 @@ from typing import Any
 from ai_consultant_bot.config import Settings
 from ai_consultant_bot.storage import (
     cancel_generation,
-    get_lead,
+    conversation_chat_ids,
+    get_conversation_lead,
     get_setting,
     open_database,
     set_setting,
 )
+
+CONVERSATIONS = """
+WITH members AS (
+    SELECT *, MIN(id) OVER (PARTITION BY account_id, lead_id, integration_id) AS conversation_id
+    FROM chats
+)
+"""
 
 
 def read_settings(settings: Settings) -> dict[str, Any]:
@@ -36,20 +44,36 @@ def update_settings(settings: Settings, model: str, auto_reply: bool) -> dict[st
 
 def list_chats(settings: Settings, offset: int = 0) -> dict[str, Any]:
     with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
+        connection.execute("BEGIN")
         rows = connection.execute(
-            "SELECT c.*, p.instagram_username, l.name, l.phone, l.furniture_type, l.city, "
-            "(SELECT text FROM messages WHERE chat_id = c.id ORDER BY id DESC LIMIT 1) "
-            "AS last_text, (SELECT COUNT(*) FROM drafts WHERE chat_id = c.id "
-            "AND status = 'pending') AS pending_drafts "
-            "FROM chats c LEFT JOIN leads l ON l.chat_id = c.id "
-            "LEFT JOIN chat_profiles p ON p.chat_id = c.id "
-            "ORDER BY (SELECT MAX(id) FROM messages WHERE chat_id = c.id) DESC, c.id DESC "
+            CONVERSATIONS + "SELECT c.*, (SELECT p.instagram_username FROM chat_profiles p "
+            "JOIN members g ON g.id = p.chat_id WHERE g.conversation_id = c.id "
+            "ORDER BY julianday(p.occurred_at) DESC, p.chat_id DESC LIMIT 1) AS instagram_username, "
+            "(SELECT text FROM messages m JOIN members g ON g.id = m.chat_id "
+            "WHERE g.conversation_id = c.id ORDER BY m.id DESC LIMIT 1) AS last_text, "
+            "(SELECT COUNT(*) FROM drafts d JOIN members g ON g.id = d.chat_id "
+            "WHERE g.conversation_id = c.id AND d.status = 'pending') AS pending_drafts, "
+            "(SELECT GROUP_CONCAT(DISTINCT source_type) FROM members g "
+            "WHERE g.conversation_id = c.id) AS source_types, "
+            "(SELECT MAX(paused) FROM members g WHERE g.conversation_id = c.id) "
+            "AS conversation_paused FROM members c WHERE c.id = c.conversation_id "
+            "ORDER BY (SELECT MAX(m.id) FROM messages m JOIN members g ON g.id = m.chat_id "
+            "WHERE g.conversation_id = c.id) DESC, c.id DESC "
             "LIMIT ? OFFSET ?",
             (settings.panel_page_size, offset),
         ).fetchall()
         return {
-            "items": [dict(row) for row in rows],
-            "total": connection.execute("SELECT COUNT(*) FROM chats").fetchone()[0],
+            "items": [
+                {
+                    **dict(row),
+                    **asdict(get_conversation_lead(connection, row["id"])),
+                    "paused": row["conversation_paused"],
+                }
+                for row in rows
+            ],
+            "total": connection.execute(
+                CONVERSATIONS + "SELECT COUNT(DISTINCT conversation_id) FROM members"
+            ).fetchone()[0],
         }
 
 
@@ -57,43 +81,61 @@ def chat_detail(settings: Settings, chat_id: int, offset: int = 0) -> dict[str, 
     with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
         # Keep the snapshot consistent while the worker/webhooks write on other connections.
         connection.execute("BEGIN")
-        chat = connection.execute(
-            "SELECT c.*, p.instagram_username FROM chats c "
-            "LEFT JOIN chat_profiles p ON p.chat_id = c.id WHERE c.id = ?",
-            (chat_id,),
+        member_ids = conversation_chat_ids(connection, chat_id)
+        placeholders = ",".join("?" for _ in member_ids)
+        chat = connection.execute("SELECT * FROM chats WHERE id = ?", (member_ids[0],)).fetchone()
+        chat = dict(chat)
+        members = connection.execute(
+            f"SELECT id, source_type, paused FROM chats WHERE id IN ({placeholders})", member_ids
+        ).fetchall()
+        chat["paused"] = max(row["paused"] for row in members)
+        profile = connection.execute(
+            f"SELECT instagram_username FROM chat_profiles WHERE chat_id IN ({placeholders}) "
+            "ORDER BY julianday(occurred_at) DESC, chat_id DESC LIMIT 1",
+            member_ids,
         ).fetchone()
-        if chat is None:
-            raise LookupError("Chat not found")
+        chat["instagram_username"] = profile[0] if profile else None
+        direct_ids = [row["id"] for row in members if row["source_type"] == "message"]
+        reply_block_reason = (
+            None
+            if len(direct_ids) == 1
+            else "ambiguous_direct_route"
+            if direct_ids
+            else "comment_private_reply_unverified"
+        )
         messages = connection.execute(
             "SELECT m.*, ctx.post_url, ctx.post_description, ctx.post_owner, "
-            "ctx.reply_block_reason FROM messages m LEFT JOIN message_context ctx "
-            "ON ctx.message_id = m.id WHERE m.chat_id = ? "
+            "ctx.reply_block_reason, p.photo_url AS post_photo_url "
+            "FROM messages m LEFT JOIN message_context ctx "
+            "ON ctx.message_id = m.id LEFT JOIN message_previews p ON p.message_id = m.id "
+            f"WHERE m.chat_id IN ({placeholders}) "
             "ORDER BY julianday(m.occurred_at) DESC, m.id DESC LIMIT ? OFFSET ?",
-            (chat_id, settings.panel_page_size, offset),
+            (*member_ids, settings.panel_page_size, offset),
         ).fetchall()
         drafts = connection.execute(
-            "SELECT * FROM drafts WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
-            (chat_id, settings.panel_page_size),
+            "SELECT d.*, c.source_type FROM drafts d JOIN chats c ON c.id = d.chat_id "
+            f"WHERE d.chat_id IN ({placeholders}) ORDER BY d.id DESC LIMIT ?",
+            (*member_ids, settings.panel_page_size),
         ).fetchall()
         attempts = connection.execute(
             "SELECT a.*, EXISTS (SELECT 1 FROM outgoing_receipts r JOIN messages m "
             "ON m.id = r.message_id WHERE r.custom_id = a.request_id "
             "AND m.chat_id = a.chat_id AND m.text = a.text) AS confirmed "
-            "FROM outgoing_attempts a WHERE a.chat_id = ? ORDER BY a.created_at DESC LIMIT ?",
-            (chat_id, settings.panel_page_size),
+            f"FROM outgoing_attempts a WHERE a.chat_id IN ({placeholders}) "
+            "ORDER BY a.created_at DESC LIMIT ?",
+            (*member_ids, settings.panel_page_size),
         ).fetchall()
         return {
-            "chat": dict(chat),
-            "lead": asdict(get_lead(connection, chat_id)),
+            "chat": chat,
+            "reply_chat_id": direct_ids[0] if len(direct_ids) == 1 else None,
+            "lead": asdict(get_conversation_lead(connection, chat_id)),
             "messages": [dict(row) for row in reversed(messages)],
             "message_total": connection.execute(
-                "SELECT COUNT(*) FROM messages WHERE chat_id = ?", (chat_id,)
+                f"SELECT COUNT(*) FROM messages WHERE chat_id IN ({placeholders})", member_ids
             ).fetchone()[0],
             "drafts": [dict(row) for row in drafts],
             "attempts": [dict(row) for row in attempts],
-            "reply_block_reason": "comment_private_reply_unverified"
-            if chat["source_type"] == "comment"
-            else None,
+            "reply_block_reason": reply_block_reason,
         }
 
 
@@ -101,15 +143,12 @@ def set_pause(settings: Settings, chat_id: int, paused: bool) -> dict[str, bool]
     with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
         with connection:
             connection.execute("BEGIN IMMEDIATE")
-            if (
+            for member_id in conversation_chat_ids(connection, chat_id):
                 connection.execute(
-                    "UPDATE chats SET paused = ? WHERE id = ?", (int(paused), chat_id)
-                ).rowcount
-                != 1
-            ):
-                raise LookupError("Chat not found")
-            if paused:
-                cancel_generation(connection, chat_id)
+                    "UPDATE chats SET paused = ? WHERE id = ?", (int(paused), member_id)
+                )
+                if paused:
+                    cancel_generation(connection, member_id)
     return {"paused": paused}
 
 

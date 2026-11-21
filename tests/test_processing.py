@@ -206,6 +206,50 @@ def test_comment_stays_private_draft_even_in_auto_mode(settings: Settings) -> No
     assert not rows(settings, "outgoing_attempts")
 
 
+def test_comment_uses_direct_history_and_lead_without_auto_sending(settings: Settings) -> None:
+    ingest_event(settings, event("direct", "Я Анна, нужен диван"))
+    with open_database(settings.database_path, timeout=1) as connection, connection:
+        connection.execute("UPDATE jobs SET status = 'done'")
+        connection.execute("INSERT INTO drafts(chat_id, message_id, text) VALUES (1, 1, 'Старый')")
+        save_lead(connection, 1, Lead(name="Анна", city="Минск"))
+        set_setting(connection, "auto_reply", "1")
+    ingest_event(settings, event("comment", "А этот подойдёт?", source="comment"))
+    assert rows(settings, "drafts")[0]["status"] == "stale"
+
+    def handler(request):
+        assert request.url.path.endswith("chat/completions")
+        content = json.loads(json.loads(request.content)["messages"][1]["content"])
+        assert [item["text"] for item in content["history"]] == [
+            "Я Анна, нужен диван",
+            "А этот подойдёт?",
+        ]
+        assert content["known_lead"]["name"] == "Анна"
+        assert content["known_lead"]["city"] == "Минск"
+        return completion()
+
+    asyncio.run(process(settings, handler))
+    assert rows(settings, "drafts")[-1]["status"] == "pending"
+    assert rows(settings, "drafts")[-1]["chat_id"] == 2
+    assert not rows(settings, "outgoing_attempts")
+
+
+def test_comment_during_direct_generation_invalidates_old_reply(settings: Settings) -> None:
+    ingest_event(settings, event())
+    with open_database(settings.database_path, timeout=1) as connection, connection:
+        set_setting(connection, "auto_reply", "1")
+
+    def handler(request):
+        assert request.url.path.endswith("chat/completions")
+        ingest_event(settings, event("comment", "Уточнение", source="comment"))
+        with open_database(settings.database_path, timeout=1) as connection, connection:
+            assert claim_next_job(connection) is None
+        return completion()
+
+    asyncio.run(process(settings, handler))
+    assert not rows(settings, "drafts") and not rows(settings, "outgoing_attempts")
+    assert [row["status"] for row in rows(settings, "jobs")] == ["done", "pending"]
+
+
 @pytest.mark.parametrize("change", ["incoming", "pause", "mode"])
 def test_changes_during_generation_prevent_send(settings: Settings, change: str) -> None:
     ingest_event(settings, event())

@@ -107,6 +107,10 @@ CREATE TABLE IF NOT EXISTS outgoing_receipts (
     custom_id TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS outgoing_receipt_custom_id ON outgoing_receipts(custom_id);
+CREATE TABLE IF NOT EXISTS message_previews (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+    photo_url TEXT NOT NULL
+);
 """
 
 
@@ -179,9 +183,11 @@ def set_setting(connection: sqlite3.Connection, key: str, value: str) -> None:
 def save_chat(connection: sqlite3.Connection, key: ChatKey) -> int:
     values = tuple(asdict(key).values())
     connection.execute(
-        "INSERT INTO chats(account_id, lead_id, integration_id, source_type, source_id) "
-        "VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-        values,
+        "INSERT INTO chats(account_id, lead_id, integration_id, source_type, source_id, paused) "
+        "VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(paused) FROM chats "
+        "WHERE account_id = ? AND lead_id = ? AND integration_id = ?), 0)) "
+        "ON CONFLICT DO NOTHING",
+        (*values, key.account_id, key.lead_id, key.integration_id),
     )
     row = connection.execute(
         "SELECT id FROM chats WHERE account_id = ? AND lead_id = ? AND integration_id = ? "
@@ -189,6 +195,30 @@ def save_chat(connection: sqlite3.Connection, key: ChatKey) -> int:
         values,
     ).fetchone()
     return row["id"]
+
+
+def conversation_chat_ids(connection: sqlite3.Connection, chat_id: int) -> list[int]:
+    """Group source routes by Umnico customer, within one account and integration."""
+    rows = connection.execute(
+        "SELECT peer.id FROM chats c JOIN chats peer ON peer.account_id = c.account_id "
+        "AND peer.lead_id = c.lead_id AND peer.integration_id = c.integration_id "
+        "WHERE c.id = ? ORDER BY peer.id",
+        (chat_id,),
+    ).fetchall()
+    if not rows:
+        raise LookupError("Chat not found")
+    return [row["id"] for row in rows]
+
+
+def save_message_preview(
+    connection: sqlite3.Connection, message_id: int, event: MessageEvent
+) -> None:
+    if event.post_photo_url is not None:
+        connection.execute(
+            "INSERT INTO message_previews(message_id, photo_url) VALUES (?, ?) "
+            "ON CONFLICT(message_id) DO UPDATE SET photo_url = excluded.photo_url",
+            (message_id, event.post_photo_url),
+        )
 
 
 def save_message(
@@ -253,6 +283,7 @@ def store_event(
             and existing["source_id"] == event.chat.source_id
         ):
             save_chat_profile(connection, existing["chat_id"], event)
+            save_message_preview(connection, existing["id"], event)
         save_outgoing_receipt(connection, existing["id"], event)
         return False
     chat_id = save_chat(connection, event.chat)
@@ -284,11 +315,14 @@ def store_event(
         ),
     )
     save_outgoing_receipt(connection, message_id, event)
+    save_message_preview(connection, message_id, event)
     if not imported and event.direction == "incoming":
+        member_ids = conversation_chat_ids(connection, chat_id)
+        placeholders = ",".join("?" for _ in member_ids)
         connection.execute(
-            "UPDATE drafts SET status = 'stale' WHERE chat_id = ? "
+            f"UPDATE drafts SET status = 'stale' WHERE chat_id IN ({placeholders}) "
             "AND status IN ('pending', 'approved')",
-            (chat_id,),
+            member_ids,
         )
         if event.text.strip():
             connection.execute("INSERT INTO jobs(message_id) VALUES (?)", (message_id,))
@@ -370,16 +404,22 @@ def save_outgoing_receipt(
 
 
 def claim_next_job(connection: sqlite3.Connection) -> sqlite3.Row | None:
-    """Caller holds BEGIN IMMEDIATE; one active job per unpaused chat, FIFO."""
+    """Caller holds BEGIN IMMEDIATE; one active job per unpaused conversation, FIFO."""
     row = connection.execute(
         "SELECT j.id, j.message_id, m.chat_id FROM jobs j "
         "JOIN messages m ON m.id = j.message_id JOIN chats c ON c.id = m.chat_id "
         "WHERE j.status = 'pending' AND c.paused = 0 "
         "AND NOT EXISTS (SELECT 1 FROM jobs active JOIN messages am "
-        "ON am.id = active.message_id WHERE am.chat_id = c.id "
+        "ON am.id = active.message_id JOIN chats ac ON ac.id = am.chat_id "
+        "WHERE ac.account_id = c.account_id AND ac.lead_id = c.lead_id "
+        "AND ac.integration_id = c.integration_id "
         "AND active.status IN ('processing', 'unknown')) "
-        "AND NOT EXISTS (SELECT 1 FROM outgoing_attempts o "
-        "WHERE o.chat_id = c.id AND o.status = 'unknown') ORDER BY j.id LIMIT 1"
+        "AND NOT EXISTS (SELECT 1 FROM outgoing_attempts o JOIN chats oc ON oc.id = o.chat_id "
+        "WHERE oc.account_id = c.account_id AND oc.lead_id = c.lead_id "
+        "AND oc.integration_id = c.integration_id AND o.status = 'unknown') "
+        "AND NOT EXISTS (SELECT 1 FROM chats pc WHERE pc.account_id = c.account_id "
+        "AND pc.lead_id = c.lead_id AND pc.integration_id = c.integration_id AND pc.paused = 1) "
+        "ORDER BY j.id LIMIT 1"
     ).fetchone()
     if row is not None:
         connection.execute("UPDATE jobs SET status = 'processing' WHERE id = ?", (row["id"],))
@@ -407,13 +447,33 @@ def get_lead(connection: sqlite3.Connection, chat_id: int) -> Lead:
     return Lead(**{name: row[name] for name in asdict(Lead())}) if row else Lead()
 
 
+def get_conversation_lead(connection: sqlite3.Connection, chat_id: int) -> Lead:
+    member_ids = conversation_chat_ids(connection, chat_id)
+    placeholders = ",".join("?" for _ in member_ids)
+    rows = connection.execute(
+        f"SELECT * FROM leads WHERE chat_id IN ({placeholders}) "
+        "ORDER BY julianday(updated_at) DESC, chat_id DESC",
+        member_ids,
+    ).fetchall()
+    return Lead(
+        **{
+            name: next((row[name] for row in rows if row[name] is not None), None)
+            for name in asdict(Lead())
+        }
+    )
+
+
 def consultation_is_current(connection: sqlite3.Connection, job_id: int) -> bool:
     return (
         connection.execute(
             "SELECT 1 FROM jobs j JOIN messages m ON m.id = j.message_id "
             "JOIN chats c ON c.id = m.chat_id WHERE j.id = ? AND j.status = 'processing' "
-            "AND c.paused = 0 AND NOT EXISTS (SELECT 1 FROM messages newer "
-            "WHERE newer.chat_id = c.id AND newer.direction = 'incoming' "
+            "AND c.paused = 0 AND NOT EXISTS (SELECT 1 FROM chats pc "
+            "WHERE pc.account_id = c.account_id AND pc.lead_id = c.lead_id "
+            "AND pc.integration_id = c.integration_id AND pc.paused = 1) "
+            "AND NOT EXISTS (SELECT 1 FROM messages newer JOIN chats nc ON nc.id = newer.chat_id "
+            "WHERE nc.account_id = c.account_id AND nc.lead_id = c.lead_id "
+            "AND nc.integration_id = c.integration_id AND newer.direction = 'incoming' "
             "AND newer.imported = 0 AND newer.id > m.id)",
             (job_id,),
         ).fetchone()
@@ -427,15 +487,18 @@ def load_consultation_context(
     settings: Settings,
 ) -> dict[str, Any]:
     chat = connection.execute("SELECT * FROM chats WHERE id = ?", (job["chat_id"],)).fetchone()
+    member_ids = conversation_chat_ids(connection, job["chat_id"])
+    placeholders = ",".join("?" for _ in member_ids)
     rows = connection.execute(
         "SELECT direction, text FROM ("
-        "SELECT direction, text, occurred_at, id AS sequence FROM messages WHERE chat_id = ? "
+        "SELECT direction, text, occurred_at, id AS sequence FROM messages "
+        f"WHERE chat_id IN ({placeholders}) "
         "UNION ALL SELECT 'outgoing', a.text, a.created_at, 0 FROM outgoing_attempts a "
-        "WHERE a.chat_id = ? AND a.status = 'sent' AND NOT EXISTS ("
+        f"WHERE a.chat_id IN ({placeholders}) AND a.status = 'sent' AND NOT EXISTS ("
         "SELECT 1 FROM outgoing_receipts r JOIN messages m ON m.id = r.message_id "
         "WHERE r.custom_id = a.request_id AND m.chat_id = a.chat_id AND m.text = a.text)) "
         "ORDER BY (sequence = ?) DESC, julianday(occurred_at) DESC, sequence DESC LIMIT ?",
-        (job["chat_id"], job["chat_id"], job["message_id"], settings.history_context_messages),
+        (*member_ids, *member_ids, job["message_id"], settings.history_context_messages),
     ).fetchall()
     remaining = settings.history_context_chars
     history = []
@@ -451,7 +514,7 @@ def load_consultation_context(
     ).fetchone()
     return {
         "history": list(reversed(history)),
-        "lead": get_lead(connection, job["chat_id"]),
+        "lead": get_conversation_lead(connection, job["chat_id"]),
         "source_type": chat["source_type"],
         "post": {key: (post[key] or "")[: settings.knowledge_chunk_chars] for key in post.keys()}
         if post
