@@ -26,6 +26,7 @@ class OpenRouterClient:
             read_timeout=settings.openrouter_read_timeout,
             transport=transport,
             enabled=settings.external_apis_enabled,
+            proxy_url=settings.openrouter_proxy_url or None,
         )
 
     async def __aenter__(self) -> OpenRouterClient:

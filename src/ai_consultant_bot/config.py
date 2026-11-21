@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import httpx
 from dotenv import dotenv_values
 
 from ai_consultant_bot.webhooks import build_webhook_url
@@ -18,6 +19,7 @@ SECRET_FIELDS = (
     "umnico_password",
     "umnico_api_key",
     "openrouter_api_key",
+    "openrouter_proxy_url",
     "admin_token",
     "webhook_token",
 )
@@ -40,6 +42,7 @@ class Settings:
     # Explicit sender used in the confirmed test account; change for another account.
     umnico_user_id: str = "2583899"
     openrouter_api_key: str = field(default="", repr=False)
+    openrouter_proxy_url: str = field(default="", repr=False)
     admin_token: str = field(default="", repr=False)
     webhook_token: str = field(default="", repr=False)
     umnico_history_verified: bool = True
@@ -91,6 +94,24 @@ class Settings:
                 raise ValueError("Server environments must listen on IPv4 loopback")
         if self.environment == "production" and not self.public_base_url:
             raise ValueError("PUBLIC_BASE_URL is required in production")
+        if self.openrouter_proxy_url:
+            try:
+                proxy = httpx.URL(self.openrouter_proxy_url)
+                if (
+                    proxy.scheme not in {"http", "https"}
+                    or not proxy.host
+                    or proxy.path not in {"", "/"}
+                    or proxy.query
+                    or proxy.fragment
+                    or (proxy.port is not None and not 1 <= proxy.port <= 65535)
+                    or any(char.isspace() for char in self.openrouter_proxy_url)
+                ):
+                    raise ValueError
+            except (httpx.InvalidURL, ValueError):
+                raise ValueError(
+                    "OPENROUTER_PROXY_URL must be an HTTP(S) proxy URL "
+                    "without path, query or fragment"
+                ) from None
         if bool(self.umnico_login) != bool(self.umnico_password):
             raise ValueError("UMNICO_LOGIN and UMNICO_PASSWORD must be set together")
         for name in (

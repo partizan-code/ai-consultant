@@ -61,6 +61,13 @@ mise exec -- uv run --no-sync python scripts/generate_webhook_token.py
 Через файл или окружение задаются также `APP_ENV` (`local`, `staging`, `production`),
 `PUBLIC_BASE_URL`, `REGISTER_WEBHOOK` (`true`/`false`), `SERVER_HOST`, `SERVER_PORT`,
 `PANEL_PORT`, `DATABASE_PATH`, `KNOWLEDGE_BASE_PATH`, `LOG_LEVEL`, `UMNICO_USER_ID`.
+`OPENROUTER_PROXY_URL` задаёт необязательный HTTP(S)-прокси только для OpenRouter,
+например `http://127.0.0.1:18080`; пустое значение означает прямое подключение.
+Umnico и соединение панели с backend используют свои прежние маршруты.
+URL прокси не должен содержать путь (кроме `/`), query или fragment; SOCKS не поддерживается.
+Если прокси требует логин/пароль, храните URL как секрет. После изменения перезапустите
+backend. При сбое заданного прокси автоматического перехода на прямое подключение нет.
+Общие переменные `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` не используются.
 Другие параметры по-прежнему задаются в `Settings` в
 [config.py](../src/ai_consultant_bot/config.py). Значения не интерполируются.
 

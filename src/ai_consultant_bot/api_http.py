@@ -31,6 +31,7 @@ def create_http_client(
     read_timeout: float,
     transport: httpx.AsyncBaseTransport | None = None,
     enabled: bool = True,
+    proxy_url: str | None = None,
 ) -> httpx.AsyncClient:
     try:
         url = httpx.URL(base_url)
@@ -44,6 +45,8 @@ def create_http_client(
         follow_redirects=False,
         trust_env=False,
         transport=transport if enabled else DisabledAPITransport(),
+        # HTTPX proxy mounts otherwise take precedence over the supplied transport.
+        proxy=proxy_url if enabled and transport is None else None,
     )
 
 

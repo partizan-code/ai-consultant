@@ -163,10 +163,45 @@ def test_secrets_are_absent_from_settings_repr() -> None:
         umnico_password="private-password",
         umnico_api_key="private-jwt",
         openrouter_api_key="private-key",
+        openrouter_proxy_url="http://private-user:private-password@proxy.example:18080",
         admin_token="private-admin",
         webhook_token="private-webhook-token",
     )
     assert "private-" not in repr(settings)
+
+
+def test_proxy_file_and_environment_precedence(tmp_path: Path) -> None:
+    path = tmp_path / "settings.env"
+    path.write_text("OPENROUTER_PROXY_URL=http://127.0.0.1:18080\n", encoding="utf-8")
+    assert load_settings(path, environ={}).openrouter_proxy_url == "http://127.0.0.1:18080"
+    assert load_settings(path, environ={"OPENROUTER_PROXY_URL": ""}).openrouter_proxy_url == ""
+    assert (
+        load_settings(
+            path, environ={"OPENROUTER_PROXY_URL": " https://proxy.example:8443 "}
+        ).openrouter_proxy_url
+        == "https://proxy.example:8443"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "socks5://private-user:private-password@proxy.example:1080",
+        "http://private-user:private-password@",
+        "http://proxy.example:invalid-private-port",
+        "http://proxy.example:65536",
+        "http://proxy.example:0",
+        "http://proxy.example/private-path",
+        "http://proxy.example?private-query=value",
+        "http://proxy.example#private-fragment",
+        "http://private-host name:18080",
+    ],
+)
+def test_invalid_proxy_url_errors_do_not_expose_values(url: str) -> None:
+    with pytest.raises(ValueError, match="OPENROUTER_PROXY_URL") as error:
+        Settings(openrouter_proxy_url=url)
+    assert "private-" not in str(error.value)
+    assert url not in str(error.value)
 
 
 def test_step_two_configuration() -> None:
