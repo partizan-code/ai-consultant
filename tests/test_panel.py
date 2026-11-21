@@ -27,6 +27,8 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         reply_chat_id=None,
         failure=False,
         outcome="sent",
+        lose_send_response=False,
+        status={"calls": [], "last_error": None, "jobs": {}, "worker_enabled": False},
         messages=[],
         chats=[
             {
@@ -48,7 +50,7 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
                 state.settings = payload
             return state.settings
         if path == "status":
-            return {"calls": [], "last_error": None, "jobs": {}, "worker_enabled": False}
+            return state.status
         if path == "knowledge/reload":
             return {"chunks": 2}
         if path == "chats" or path.startswith("chats?offset="):
@@ -106,6 +108,8 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
                     "confirmed": False,
                 }
             )
+            if state.lose_send_response:
+                raise PanelError("Синтетический ответ backend потерян")
             return state.attempts[-1]
         raise AssertionError(path)
 
@@ -163,7 +167,7 @@ def test_panel_manual_reply_and_refresh_do_not_resend(backend: SimpleNamespace) 
     assert backend.paused and backend.drafts[0]["status"] == "stale"
     assert not app.toggle(key="bot_active_1").value
     assert len(backend.attempts) == 1
-    button(app, "Обновить данные").click().run()
+    app.run()
     assert len(backend.attempts) == 1 and not app.exception
     assert app.text_area[0].value == ""
 
@@ -174,7 +178,7 @@ def test_panel_unknown_disables_new_manual_send(backend: SimpleNamespace) -> Non
     app.text_area[0].set_value("Здравствуйте")
     button(app, "Отправить ответ").click().run()
     assert button(app, "Отправить ответ").disabled
-    button(app, "Обновить данные").click().run()
+    app.run()
     assert len(backend.attempts) == 1 and not app.exception
 
 
@@ -184,7 +188,7 @@ def test_panel_comment_and_backend_error(backend: SimpleNamespace) -> None:
     assert button(app, "Одобрить и отправить").disabled
     assert button(app, "Отправить ответ").disabled
     backend.failure = True
-    button(app, "Обновить данные").click().run()
+    app.run()
     assert app.error[0].value == "Синтетический backend недоступен" and not app.exception
 
 
@@ -251,11 +255,25 @@ def timer(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     AppTest has no public timer driver. Intercept its runner only in these tests;
     production code uses the public st.fragment API.
     """
-    state = SimpleNamespace(active=False, registrations=[])
+    state = SimpleNamespace(active=False, registrations=[], deliver=False, only=None)
     original_run = LocalScriptRunner.run
     original_request = ScriptRequests.request_rerun
 
     def run(runner, *args, **kwargs):
+        state.deliver = state.active
+        state.fragment_ids = list(
+            dict.fromkeys(
+                fragment_id
+                for fragment_id, _ in state.registrations
+                if runner._fragment_storage.contains(fragment_id)
+            )
+        )
+        if state.only is not None:
+            state.fragment_ids = [state.fragment_ids[state.only]]
+        if state.active:
+            # AppTest seeds a full rerun in the constructor; replace it with the
+            # timer request rather than coalescing it into a full page redraw.
+            runner._requests.on_scriptrunner_ready()
         result = original_run(runner, *args, **kwargs)
         state.registrations.extend(
             (message.auto_rerun.fragment_id, message.auto_rerun.interval)
@@ -265,8 +283,9 @@ def timer(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         return result
 
     def request(runner, data):
-        if state.active:
-            data = replace(data, fragment_id=state.registrations[-1][0], is_auto_rerun=True)
+        if state.deliver:
+            state.deliver = False
+            data = replace(data, fragment_id_queue=state.fragment_ids, is_auto_rerun=True)
         return original_request(runner, data)
 
     monkeypatch.setattr(LocalScriptRunner, "run", run)
@@ -308,13 +327,17 @@ def test_timer_updates_chat_without_redrawing_form_or_sending(
         }
     )
     backend.calls.clear()
-    assert timer.registrations and timer.registrations[-1][1] == 3.0
+    assert timer.registrations and all(interval == 10.0 for _, interval in timer.registrations)
     timer.active = True
     app.run()
     assert not app.exception
     assert any(item.value == "Новое сообщение" for item in app.text)
     assert len(form_calls) == form_count
-    assert backend.calls == [("GET", "chats/2", None)]
+    assert backend.calls == [
+        ("GET", "chats", None),
+        ("GET", "chats/2", None),
+        ("GET", "chats/2", None),
+    ]
     assert app.session_state["selected_chat_id"] == 2
     # A subsequent full rerun still has the same text and selected chat.
     timer.active = False
@@ -335,7 +358,7 @@ def test_scroll_initialization_changes_on_full_refresh_but_not_timer(
     app = panel()
     first = scroll_script(app)
     assert 'const view = "1:0:1"' in first
-    button(app, "Обновить данные").click().run()
+    app.run()
     refreshed = scroll_script(app)
     assert not app.exception and 'const view = "1:0:2"' in refreshed
     timer.active = True
@@ -361,7 +384,7 @@ def test_chat_tabs_open_only_selected_chat_and_keep_selection(backend: SimpleNam
     assert app.button(key="chat_tab_1").proto.type == "secondary"
     app.radio(key="panel_section").set_value("Настройки").run()
     app.radio(key="panel_section").set_value("Чаты и заявки").run()
-    button(app, "Обновить данные").click().run()
+    app.run()
     assert not app.exception and app.session_state["selected_chat_id"] == 2
     assert not backend.attempts
 
@@ -410,7 +433,7 @@ def test_login_title_refresh_does_not_request_display_name(backend: SimpleNamesp
     app.session_state["refresh_account_profile"] = True
     app.run()
     assert not app.exception and not app.warning
-    button(app, "Обновить данные").click().run()
+    app.run()
     assert not app.exception and not app.warning
     assert app.button(key="chat_tab_1").label == "partizan_code · #1"
     assert all("/account-profile" not in path for _, path, _ in backend.calls)
@@ -506,3 +529,163 @@ def test_timer_recovers_from_backend_error(
     assert not app.exception and not app.error
     assert not app.toggle(key="bot_active_1").value
     assert all(method == "GET" for method, _, _ in backend.calls)
+
+
+def test_timer_updates_chat_list_without_switching_or_resetting_reply(
+    backend: SimpleNamespace, timer: SimpleNamespace
+) -> None:
+    app = panel(page_size=1)
+    app.session_state["manual_text_1_0"] = "Набираемый ответ"
+    app.run()
+    backend.chats.insert(0, {**backend.chats[0], "id": 2, "instagram_username": "new_client"})
+    backend.chats[0]["pending_drafts"] = 4
+    backend.calls.clear()
+    timer.active = True
+    app.run()
+    assert not app.exception
+    assert app.button(key="chat_tab_2").label == "new_client · #2"
+    assert any("черновиков: 4" in item.value for item in app.caption)
+    assert app.session_state["selected_chat_id"] == 1
+    assert app.session_state["manual_text_1_0"] == "Набираемый ответ"
+    assert all(method == "GET" for method, _, _ in backend.calls)
+    assert not any(item.label == "Обновить данные" for item in app.button)
+
+
+@pytest.mark.parametrize("initial", ["empty", "unavailable"])
+def test_timer_opens_first_chat_after_empty_list_or_initial_error(
+    backend: SimpleNamespace, timer: SimpleNamespace, initial: str
+) -> None:
+    chats = backend.chats
+    backend.chats = [] if initial == "empty" else chats
+    backend.failure = initial == "unavailable"
+    app = panel()
+    assert not app.exception and not app.text_area
+    assert timer.registrations and all(interval == 10 for _, interval in timer.registrations)
+    backend.chats = chats
+    backend.failure = False
+    backend.calls.clear()
+    timer.active = True
+    app.run()
+    assert not app.exception and not app.error and len(app.text_area) == 1
+    assert app.session_state["selected_chat_id"] == 1
+    assert all(method == "GET" for method, _, _ in backend.calls)
+
+
+def test_timer_updates_manual_send_availability_without_redrawing_input(
+    backend: SimpleNamespace, timer: SimpleNamespace
+) -> None:
+    backend.comment = True
+    app = panel()
+    app.session_state["manual_text_1_0"] = "Набираемый ответ"
+    app.run()
+    assert button(app, "Отправить ответ").disabled
+    backend.comment = False
+    backend.reply_chat_id = 2
+    timer.active = True
+    app.run()
+    assert not app.exception and not button(app, "Отправить ответ").disabled
+    assert app.session_state["manual_text_1_0"] == "Набираемый ответ"
+    backend.attempts.append(
+        {
+            "request_id": "external",
+            "status": "unknown",
+            "text": "Другой ответ",
+            "created_at": "2026-11-21",
+            "confirmed": False,
+            "error_code": None,
+        }
+    )
+    app.run()
+    assert not app.exception and button(app, "Отправить ответ").disabled
+    backend.attempts[0]["status"] = "sent"
+    backend.attempts[0]["confirmed"] = True
+    app.run()
+    assert not app.exception and not button(app, "Отправить ответ").disabled
+    assert app.session_state["manual_text_1_0"] == "Набираемый ответ"
+    # Exercise a real form submission rerun scoped to the controls fragment.
+    timer.only = -1
+    button(app, "Отправить ответ").click().run()
+    assert not app.exception
+    assert [path for method, path, _ in backend.calls if method == "POST"] == ["chats/2/send-text"]
+
+
+def test_timer_recovers_lost_send_response_without_resending(
+    backend: SimpleNamespace, timer: SimpleNamespace
+) -> None:
+    backend.lose_send_response = True
+    app = panel()
+    app.text_area[0].set_value("Здравствуйте")
+    timer.active = True
+    timer.only = -1
+    button(app, "Отправить ответ").click().run()
+    assert not app.exception and app.error
+    assert len(backend.attempts) == 1
+    backend.calls.clear()
+    app.run()
+    app.run()
+    assert not app.exception and not app.error and app.success
+    assert len(backend.attempts) == 1
+    assert all(method == "GET" for method, _, _ in backend.calls)
+    # The recovered original text must not become a fresh request on a second click.
+    app.session_state["manual_text_1_0"] = "Здравствуйте"
+    button(app, "Отправить ответ").click().run()
+    assert not app.exception and len(backend.attempts) == 1
+    assert app.text_area[0].value == ""
+    assert all(method == "GET" for method, _, _ in backend.calls)
+
+
+def test_timer_keeps_settings_edits_and_shows_current_saved_values(
+    backend: SimpleNamespace, timer: SimpleNamespace
+) -> None:
+    app = panel()
+    app.radio(key="panel_section").set_value("Настройки").run()
+    app.session_state["settings_model"] = "unsaved/model"
+    app.session_state["settings_auto_reply"] = True
+    app.run()
+    backend.settings = {"model": "external/model", "auto_reply": False}
+    backend.calls.clear()
+    timer.active = True
+    app.run()
+    assert not app.exception
+    assert app.session_state["settings_model"] == "unsaved/model"
+    assert app.session_state["settings_auto_reply"]
+    assert any("external/model" in item.value for item in app.caption)
+    assert backend.calls == [("GET", "settings", None)]
+
+
+@pytest.mark.parametrize("section", ["Состояние", "Настройки"])
+def test_section_timer_recovers_from_initial_error(
+    backend: SimpleNamespace, timer: SimpleNamespace, section: str
+) -> None:
+    app = panel()
+    backend.failure = True
+    app.radio(key="panel_section").set_value(section).run()
+    assert app.error and not app.exception
+    backend.failure = False
+    backend.status["worker_enabled"] = True
+    backend.status["last_error"] = {"code": "synthetic_error"}
+    backend.calls.clear()
+    timer.active = True
+    app.run()
+    assert not app.exception and not app.error
+    if section == "Состояние":
+        assert len(app.table) == 1 and not app.warning
+    else:
+        assert len(app.text_input) == 1
+    assert all(method == "GET" for method, _, _ in backend.calls)
+
+
+def test_timer_clamps_chat_page_when_list_shrinks(
+    backend: SimpleNamespace, timer: SimpleNamespace
+) -> None:
+    backend.chats.append({**backend.chats[0], "id": 2})
+    app = panel(page_size=1)
+    app.number_input(key="chats_page").set_value(2).run()
+    backend.chats.pop()
+    timer.active = True
+    app.run()
+    assert not app.exception and app.session_state["selected_chat_id"] == 1
+    backend.chats.clear()
+    app.run()
+    assert not app.exception and not app.text_area
+    assert "selected_chat_id" not in app.session_state

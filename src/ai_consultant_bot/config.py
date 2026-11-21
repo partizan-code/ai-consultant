@@ -67,7 +67,7 @@ class Settings:
     panel_port: int = 8501
     panel_page_size: int = 50
     panel_request_timeout: float = 30.0
-    panel_refresh_interval: float = 3.0
+    panel_refresh_interval: float = 10.0
     model_max_chars: int = 200
 
     def __post_init__(self) -> None:

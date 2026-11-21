@@ -40,15 +40,15 @@ def admin_request(
             )
     except httpx.HTTPError:
         raise PanelError(
-            "Backend недоступен или время ожидания истекло. Обновите данные: "
+            "Backend недоступен или время ожидания истекло. Дождитесь автообновления: "
             "результат отправки мог сохраниться на сервере."
         ) from None
     if not response.is_success:
         messages = {
             400: "Проверьте введённые значения.",
             401: "ADMIN_TOKEN панели и backend не совпадает.",
-            404: "Запись не найдена. Обновите данные.",
-            409: "Действие заблокировано. Обновите чат и проверьте паузу и состояние отправки.",
+            404: "Запись не найдена. Дождитесь автоматического обновления данных.",
+            409: "Действие заблокировано. После автообновления проверьте паузу и состояние отправки.",
             503: "Backend не готов: проверьте ADMIN_TOKEN и доступность SQLite.",
         }
         raise PanelError(messages.get(response.status_code, "Запрос backend не выполнен."))
@@ -58,4 +58,6 @@ def admin_request(
             raise ValueError
         return result
     except ValueError:
-        raise PanelError("Backend вернул некорректный ответ. Обновите данные.") from None
+        raise PanelError(
+            "Backend вернул некорректный ответ. Дождитесь автоматического обновления данных."
+        ) from None

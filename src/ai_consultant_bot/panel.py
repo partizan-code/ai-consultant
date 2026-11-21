@@ -102,6 +102,8 @@ def format_message_time(value: str) -> str:
 
 def page_offset(label: str, total: int, settings: Settings, key: str) -> int:
     pages = max(1, (total + settings.panel_page_size - 1) // settings.panel_page_size)
+    if key in st.session_state:
+        st.session_state[key] = min(max(1, st.session_state[key]), pages)
     if pages == 1:
         return 0
     page = st.number_input(label, min_value=1, max_value=pages, step=1, key=key)
@@ -126,8 +128,7 @@ def show_chat(settings: Settings, chat_id: int, client_card: DeltaGenerator) -> 
     st.fragment(run_every=settings.panel_refresh_interval)(show_chat_updates)(
         settings, chat_id, client_card
     )
-    detail = admin_request(settings, "GET", f"chats/{chat_id}")
-    show_manual_reply(settings, chat_id, detail)
+    show_manual_reply(settings, chat_id)
 
 
 def show_chat_updates(settings: Settings, chat_id: int, client_card: DeltaGenerator) -> None:
@@ -152,6 +153,7 @@ def change_bot_state(settings: Settings, chat_id: int) -> None:
 
 def show_chat_data(settings: Settings, chat_id: int, client_card: DeltaGenerator) -> None:
     detail = admin_request(settings, "GET", f"chats/{chat_id}")
+    st.session_state[f"chat_attempts_{chat_id}"] = detail["attempts"]
     # Replace the whole card on timer reruns instead of appending to the right column.
     with client_card.container(border=False, key="client_card"):
         st.subheader("Карточка клиента")
@@ -229,7 +231,7 @@ def show_messages(settings: Settings, chat_id: int, detail: dict) -> None:
     if st.button("Импортировать историю", key=f"history_{chat_id}"):
         route_id = detail.get("reply_chat_id") or chat_id
         result = admin_request(settings, "POST", f"chats/{route_id}/import-history")
-        st.success(f"Добавлено сообщений: {result['imported']}. Для просмотра обновите данные.")
+        st.success(f"Добавлено сообщений: {result['imported']}. Переписка обновится автоматически.")
 
 
 def show_drafts(settings: Settings, chat_id: int, detail: dict) -> None:
@@ -260,49 +262,81 @@ def show_drafts(settings: Settings, chat_id: int, detail: dict) -> None:
                 st.rerun()
 
 
-def show_manual_reply(settings: Settings, chat_id: int, detail: dict) -> None:
+def show_manual_reply(settings: Settings, chat_id: int) -> None:
     st.subheader("Ручной ответ")
     st.caption("Отправка поставит бота на паузу и отменит прежние черновики.")
-    uncertain = any(a["status"] == "unknown" for a in detail["attempts"])
     revision_key = f"manual_revision_{chat_id}"
-    revision = st.session_state.get(revision_key, 0)
     pending_key = f"manual_attempt_{chat_id}"
+    pending = st.session_state.get(pending_key)
+    attempts = st.session_state.get(f"chat_attempts_{chat_id}", [])
+    # A full rerun can clear a recovered send before creating the input widget.
+    if pending and any(
+        a["request_id"] == pending["request_id"] and a["status"] != "unknown" for a in attempts
+    ):
+        del st.session_state[pending_key]
+        st.session_state[revision_key] = st.session_state.get(revision_key, 0) + 1
+    revision = st.session_state.get(revision_key, 0)
     with st.form(f"manual_{chat_id}_{revision}"):
-        text = st.text_area(
+        st.text_area(
             "Текст ответа",
             max_chars=settings.consultation_reply_max_chars,
             key=f"manual_text_{chat_id}_{revision}",
         )
-        submit = st.form_submit_button(
-            "Отправить ответ", disabled=bool(detail["reply_block_reason"]) or uncertain
+        # Refresh only the controls within the form, leaving browser draft text untouched.
+        st.fragment(run_every=settings.panel_refresh_interval)(show_manual_updates)(
+            settings, chat_id, revision
         )
+
+
+def show_manual_updates(settings: Settings, chat_id: int, revision: int) -> None:
+    try:
+        detail = admin_request(settings, "GET", f"chats/{chat_id}")
+    except PanelError as error:
+        st.error(str(error))
+        st.form_submit_button("Отправить ответ", disabled=True)
+        return
+    uncertain = any(a["status"] == "unknown" for a in detail["attempts"])
+    submit = st.form_submit_button(
+        "Отправить ответ", disabled=bool(detail["reply_block_reason"]) or uncertain
+    )
+    revision_key = f"manual_revision_{chat_id}"
+    pending_key = f"manual_attempt_{chat_id}"
+    pending = st.session_state.get(pending_key)
+    saved = next(
+        (a for a in detail["attempts"] if pending and a["request_id"] == pending["request_id"]),
+        None,
+    )
+    if saved:
+        show_result(saved)
     if submit:
+        text = st.session_state.get(f"manual_text_{chat_id}_{revision}", "")
+        # A timed refresh may discover success after a lost HTTP response. Keep the
+        # browser text, but never turn that same text into a second outgoing request.
+        if saved and saved["status"] != "unknown":
+            del st.session_state[pending_key]
+            if pending["text"] == text:
+                st.session_state[revision_key] = revision + 1
+                st.rerun()
+            pending = None
         if not text.strip():
             st.warning("Введите текст ответа.")
         else:
-            pending = st.session_state.get(pending_key)
             if pending and pending["text"] != text:
-                st.warning("Сначала обновите данные и выясните результат предыдущего ответа.")
+                st.warning("Дождитесь обновления и выясните результат предыдущего ответа.")
             else:
                 body = pending or {"request_id": str(uuid4()), "text": text}
                 st.session_state[pending_key] = body
                 route_id = detail.get("reply_chat_id") or chat_id
-                result = admin_request(settings, "POST", f"chats/{route_id}/send-text", body)
+                try:
+                    result = admin_request(settings, "POST", f"chats/{route_id}/send-text", body)
+                except PanelError as error:
+                    st.error(str(error))
+                    return
                 st.session_state["send_result"] = result
                 if result["status"] != "unknown":
                     del st.session_state[pending_key]
                     st.session_state[revision_key] = revision + 1
                 st.rerun()
-    pending = st.session_state.get(pending_key)
-    if pending:
-        saved = next(
-            (a for a in detail["attempts"] if a["request_id"] == pending["request_id"]), None
-        )
-        if saved:
-            show_result(saved)
-            if saved["status"] != "unknown":
-                del st.session_state[pending_key]
-                st.session_state[revision_key] = revision + 1
 
 
 def show_attempts(detail: dict) -> None:
@@ -318,16 +352,27 @@ def show_attempts(detail: dict) -> None:
 
 
 def show_chats(settings: Settings) -> None:
-    listing = admin_request(settings, "GET", "chats")
-    if not listing["total"]:
-        st.info("Чатов пока нет. Они появятся после первого webhook.")
-        return
     # The old left column used 1/4 of the width; 3/16 is 25% narrower.
     chat_list, conversation, client = st.columns([3, 10, 3], gap="medium")
     client_card = client.empty()
     chat_tabs = chat_list.container(key="chat_tabs")
     with chat_tabs:
-        st.subheader("Чаты")
+        st.fragment(run_every=settings.panel_refresh_interval)(show_chat_list)(settings)
+    if chat_id := st.session_state.get("selected_chat_id"):
+        with conversation:
+            show_chat(settings, chat_id, client_card)
+
+
+def show_chat_list(settings: Settings) -> None:
+    # Register the timer before the first request, even with no chats or no backend.
+    st.subheader("Чаты")
+    try:
+        listing = admin_request(settings, "GET", "chats")
+        if not listing["total"]:
+            if st.session_state.pop("selected_chat_id", None) is not None:
+                st.rerun()
+            st.info("Чатов пока нет. Они появятся после первого webhook.")
+            return
         offset = page_offset("Страница чатов", listing["total"], settings, "chats_page")
         if offset:
             listing = admin_request(settings, "GET", f"chats?offset={offset}")
@@ -335,8 +380,13 @@ def show_chats(settings: Settings) -> None:
         if not chats:
             st.info("На этой странице нет чатов.")
             return
-        if st.session_state.get("selected_chat_id") not in chats:
+        page_changed = st.session_state.get("chat_list_offset", offset) != offset
+        st.session_state["chat_list_offset"] = offset
+        if st.session_state.get("selected_chat_id") is None or (
+            page_changed and st.session_state["selected_chat_id"] not in chats
+        ):
             st.session_state["selected_chat_id"] = next(iter(chats))
+            st.rerun()
         with st.container(height=560, border=False):
             for chat_id, chat in chats.items():
                 name = chat_title(chat)
@@ -352,9 +402,8 @@ def show_chats(settings: Settings) -> None:
                     st.rerun()
                 sources = chat.get("source_types", chat["source_type"]).replace(",", " · ")
                 st.caption(f"{sources} · черновиков: {chat['pending_drafts']}")
-    with conversation:
-        chat_id = st.session_state["selected_chat_id"]
-        show_chat(settings, chat_id, client_card)
+    except PanelError as error:
+        st.error(str(error))
 
 
 def chat_title(chat: dict) -> str:
@@ -378,12 +427,20 @@ def show_status(settings: Settings) -> None:
 
 
 def show_settings(settings: Settings) -> None:
-    data = admin_request(settings, "GET", "settings")
+    st.fragment(run_every=settings.panel_refresh_interval)(show_settings_updates)(settings)
+    data = st.session_state.get("panel_settings")
+    if data is None:
+        return
     with st.form("settings"):
         model = st.text_input(
-            "Модель OpenRouter", value=data["model"], max_chars=settings.model_max_chars
+            "Модель OpenRouter",
+            value=data["model"],
+            max_chars=settings.model_max_chars,
+            key="settings_model",
         )
-        auto_reply = st.toggle("Автоответы в Direct", value=data["auto_reply"])
+        auto_reply = st.toggle(
+            "Автоответы в Direct", value=data["auto_reply"], key="settings_auto_reply"
+        )
         st.caption(
             "При выключенных автоответах черновики требуют одобрения. "
             "Модель применяется к следующим заданиям; старые черновики не отправляются автоматически."
@@ -396,28 +453,48 @@ def show_settings(settings: Settings) -> None:
         st.success(f"База знаний обновлена: фрагментов — {result['chunks']}.")
 
 
+def show_settings_updates(settings: Settings) -> None:
+    try:
+        data = admin_request(settings, "GET", "settings")
+    except PanelError as error:
+        st.error(str(error))
+        return
+    first_load = "panel_settings" not in st.session_state
+    st.session_state["panel_settings"] = data
+    if first_load:
+        st.rerun()
+    # Keep saved values current without overwriting unsaved editor input.
+    mode = "включены" if data["auto_reply"] else "выключены"
+    st.caption(f"Сохранено: модель {data['model']}; автоответы {mode}.")
+
+
+def show_status_updates(settings: Settings) -> None:
+    try:
+        show_status(settings)
+    except PanelError as error:
+        st.error(str(error))
+
+
 def render_panel(settings: Settings) -> None:
     st.set_page_config(page_title="Мебельный консультант", page_icon="💬", layout="wide")
     st.html(PANEL_STYLES)
     with st.container(key="panel_header"):
         st.title("Мебельный консультант")
-        navigation, refresh = st.columns([4, 1])
-        with navigation:
-            section = st.radio(
-                "Раздел",
-                ["Чаты и заявки", "Состояние", "Настройки"],
-                horizontal=True,
-                label_visibility="collapsed",
-                key="panel_section",
-            )
-        refresh.button("Обновить данные")
+        section = st.radio(
+            "Раздел",
+            ["Чаты и заявки", "Состояние", "Настройки"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="panel_section",
+        )
         st.divider()
     if "send_result" in st.session_state:
         show_result(st.session_state.pop("send_result"))
     try:
-        {"Чаты и заявки": show_chats, "Состояние": show_status, "Настройки": show_settings}[
-            section
-        ](settings)
+        if section == "Состояние":
+            st.fragment(run_every=settings.panel_refresh_interval)(show_status_updates)(settings)
+        else:
+            {"Чаты и заявки": show_chats, "Настройки": show_settings}[section](settings)
     except PanelError as error:
         st.error(str(error))
 
