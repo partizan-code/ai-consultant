@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import httpx
 from loguru import logger
 
 from ai_consultant_bot.config import load_settings
@@ -33,6 +34,19 @@ def main() -> int:
         "--server.headless=true",
         "--browser.gatherUsageStats=false",
     ]
+    if settings.environment != "local":
+        command.extend(
+            [
+                "--server.fileWatcherType=none",
+                "--server.enableCORS=true",
+                "--server.enableXsrfProtection=true",
+            ]
+        )
+    if settings.public_base_url:
+        url = httpx.URL(settings.public_base_url)
+        command.extend(
+            [f"--browser.serverAddress={url.host}", f"--browser.serverPort={url.port or 443}"]
+        )
     try:
         return subprocess.run(command, check=False).returncode
     except KeyboardInterrupt:

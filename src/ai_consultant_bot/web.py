@@ -73,11 +73,11 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
             app.state.umnico = client
             app.state.openrouter = openrouter
             worker = None
-            if settings.openrouter_api_key:
+            if settings.openrouter_api_key and settings.external_apis_enabled:
                 worker = asyncio.create_task(run_worker(settings, knowledge, openrouter, client))
                 logger.info("Обработчик консультаций запущен.")
             else:
-                logger.warning("Ключ OpenRouter не задан; задания остаются в очереди.")
+                logger.warning("Обработчик консультаций выключен; задания остаются в очереди.")
             try:
                 yield
             finally:

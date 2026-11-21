@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -43,6 +44,87 @@ def test_main_accepts_programmatic_parameters(
 def test_main_rejects_missing_credentials_without_io(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("builtins.input", lambda prompt: pytest.fail("Unexpected prompt"))
     assert startup.main(Settings()) == 1
+
+
+def test_production_uses_configured_origin_without_prompt(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = replace(
+        settings,
+        environment="production",
+        public_base_url="https://ai.example.org",
+        database_path=tmp_path / "db.sqlite3",
+        knowledge_base_path=tmp_path / "knowledge",
+        server_port=8100,
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt: pytest.fail("Unexpected prompt"))
+    run = AsyncMock(return_value=0)
+    monkeypatch.setattr(startup, "run_application", run)
+    assert startup.main(settings) == 0
+    run.assert_awaited_once_with(settings, "https://ai.example.org")
+
+
+def test_staging_starts_without_credentials_or_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(
+        environment="staging",
+        database_path=tmp_path / "stage.sqlite3",
+        knowledge_base_path=tmp_path / "knowledge",
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt: pytest.fail("Unexpected prompt"))
+    run = AsyncMock(return_value=0)
+    monkeypatch.setattr(startup, "run_application", run)
+    assert startup.main(settings) == 0
+    run.assert_awaited_once_with(settings, None)
+
+
+@pytest.mark.parametrize("staging", [True, False])
+def test_startup_without_registration_still_runs_server(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staging: bool
+) -> None:
+    settings = replace(
+        settings,
+        environment="staging" if staging else "local",
+        database_path=tmp_path / "stage.sqlite3",
+        knowledge_base_path=tmp_path / "knowledge",
+        register_webhook=staging,  # Even true must not enable registration on staging.
+    )
+    served = []
+
+    class Server:
+        should_exit = False
+        started = True
+
+        def __init__(self, config: object) -> None:
+            pass
+
+        async def serve(self) -> None:
+            served.append(True)
+
+    monkeypatch.setattr(startup.uvicorn, "Server", Server)
+    monkeypatch.setattr(
+        startup, "register_when_ready", lambda *args: pytest.fail("Unexpected registration")
+    )
+    assert asyncio.run(startup.run_application(settings)) == 0
+    assert served == [True]
+
+
+def test_server_lifespan_failure_without_registration_is_an_error(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Server:
+        started = False
+        should_exit = True
+
+        def __init__(self, config: object) -> None:
+            pass
+
+        async def serve(self) -> None:
+            pass
+
+    monkeypatch.setattr(startup.uvicorn, "Server", Server)
+    assert asyncio.run(startup.run_application(replace(settings, register_webhook=False))) == 1
 
 
 @pytest.mark.parametrize("error", [EOFError, KeyboardInterrupt])

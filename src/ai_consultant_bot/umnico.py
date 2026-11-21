@@ -121,6 +121,7 @@ class UmnicoClient:
             connect_timeout=settings.connect_timeout,
             read_timeout=settings.read_timeout,
             transport=transport,
+            enabled=settings.external_apis_enabled,
         )
 
     async def __aenter__(self) -> UmnicoClient:

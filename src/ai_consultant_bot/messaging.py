@@ -333,6 +333,7 @@ async def send_text(
                 status_code is not None and 400 <= status_code < 500 and status_code != 408
             ) or error.code in {
                 "send_contract_unverified",
+                "external_api_disabled",
                 "missing_or_invalid_sender",
                 "missing_or_invalid_api_key",
                 "invalid_messaging_identifier",

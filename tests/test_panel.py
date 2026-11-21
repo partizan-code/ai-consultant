@@ -1,6 +1,7 @@
 """Headless Streamlit actions with synthetic data and a fully substituted backend."""
 
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -397,6 +398,31 @@ def test_panel_launcher_is_local_and_has_no_secrets(monkeypatch: pytest.MonkeyPa
         "ai_consultant_bot.panel_startup.load_settings", lambda: replace(settings, admin_token="")
     )
     assert main() == 1 and len(calls) == 1
+
+
+def test_server_panel_uses_public_origin_and_keeps_browser_protection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(
+        environment="production",
+        public_base_url="https://ai.example.org",
+        database_path=tmp_path / "db.sqlite3",
+        knowledge_base_path=tmp_path / "knowledge",
+        server_port=8100,
+        admin_token="private-admin",
+    )
+    monkeypatch.setattr("ai_consultant_bot.panel_startup.load_settings", lambda: settings)
+    calls = []
+    monkeypatch.setattr(
+        "ai_consultant_bot.panel_startup.subprocess.run",
+        lambda command, **kwargs: calls.append(command) or SimpleNamespace(returncode=0),
+    )
+    assert main() == 0
+    assert "--browser.serverAddress=ai.example.org" in calls[0]
+    assert "--browser.serverPort=443" in calls[0]
+    assert "--server.enableCORS=true" in calls[0]
+    assert "--server.enableXsrfProtection=true" in calls[0]
+    assert "--server.fileWatcherType=none" in calls[0]
 
 
 @pytest.fixture

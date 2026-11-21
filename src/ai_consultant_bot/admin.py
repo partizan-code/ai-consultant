@@ -172,5 +172,5 @@ def service_status(settings: Settings) -> dict[str, Any]:
             "calls": [dict(row) for row in rows],
             "last_error": dict(errors) if errors else None,
             "jobs": {row["status"]: row["count"] for row in jobs},
-            "worker_enabled": bool(settings.openrouter_api_key),
+            "worker_enabled": bool(settings.openrouter_api_key) and settings.external_apis_enabled,
         }

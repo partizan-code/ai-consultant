@@ -25,6 +25,7 @@ class OpenRouterClient:
             connect_timeout=settings.connect_timeout,
             read_timeout=settings.openrouter_read_timeout,
             transport=transport,
+            enabled=settings.external_apis_enabled,
         )
 
     async def __aenter__(self) -> OpenRouterClient:

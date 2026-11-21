@@ -1,4 +1,4 @@
-"""Application settings and automatic loading of secrets from the project .env."""
+"""Application settings for local development and isolated server environments."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import dotenv_values
+
+from ai_consultant_bot.webhooks import build_webhook_url
 
 DEFAULT_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 SECRET_FIELDS = (
@@ -23,6 +25,9 @@ SECRET_FIELDS = (
 
 @dataclass(frozen=True)
 class Settings:
+    environment: str = "local"
+    public_base_url: str = ""
+    register_webhook: bool = True
     database_path: Path = Path("data/consultant.sqlite3")
     knowledge_base_path: Path = Path("knowledge_base")
     log_level: str = "INFO"
@@ -70,7 +75,22 @@ class Settings:
     panel_history_refresh_interval: float = 3.0
     model_max_chars: int = 200
 
+    @property
+    def external_apis_enabled(self) -> bool:
+        return self.environment != "staging"
+
     def __post_init__(self) -> None:
+        if self.environment not in {"local", "staging", "production"}:
+            raise ValueError("APP_ENV must be local, staging or production")
+        if self.public_base_url:
+            build_webhook_url(self.public_base_url, "validation")
+        if self.environment != "local":
+            if not self.database_path.is_absolute() or not self.knowledge_base_path.is_absolute():
+                raise ValueError("Server data and knowledge paths must be absolute")
+            if self.server_host != "127.0.0.1":
+                raise ValueError("Server environments must listen on IPv4 loopback")
+        if self.environment == "production" and not self.public_base_url:
+            raise ValueError("PUBLIC_BASE_URL is required in production")
         if bool(self.umnico_login) != bool(self.umnico_password):
             raise ValueError("UMNICO_LOGIN and UMNICO_PASSWORD must be set together")
         for name in (
@@ -125,27 +145,61 @@ class Settings:
 def load_settings(
     env_file: Path | None = None, *, environ: Mapping[str, str] | None = None
 ) -> Settings:
-    """Load only secrets; all other values are configured through Settings in Python.
+    """Load secrets and deployment settings, with process values taking precedence.
 
-    The default file is beside pyproject.toml in this source project. A caller may
-    supply another file programmatically. Environment secrets take precedence.
+    AI_CONSULTANT_ENV_FILE selects an explicit file outside the source tree.
+    Server processes must select a file; they never fall back to the local .env.
     No parent search, interpolation, environment mutation or network access occurs.
     """
+    process = os.environ if environ is None else environ
     values: dict[str, str] = {}
-    path = DEFAULT_ENV_FILE if env_file is None else env_file
-    if env_file is not None or path.exists():
+    selected_file = process.get("AI_CONSULTANT_ENV_FILE", "").strip()
+    explicit_file = env_file is not None or bool(selected_file)
+    if process.get("APP_ENV", "local").strip() != "local" and not explicit_file:
+        raise ValueError("Server environments require AI_CONSULTANT_ENV_FILE")
+    path = (
+        env_file
+        if env_file is not None
+        else Path(selected_file)
+        if selected_file
+        else DEFAULT_ENV_FILE
+    )
+    if explicit_file or path.exists():
         with path.open(encoding="utf-8") as stream:
             values.update(
                 (key, value)
                 for key, value in dotenv_values(stream=stream, interpolate=False).items()
                 if value is not None
             )
-    values.update(os.environ if environ is None else environ)
-    kwargs: dict[str, str] = {}
+    values.update(process)
+    kwargs: dict[str, str | int | bool | Path] = {}
     for name in SECRET_FIELDS:
         key = name.upper()
         if key not in values:
             continue
         value = values[key]
         kwargs[name] = value if name == "umnico_password" else value.strip()
+    for key, name in {
+        "APP_ENV": "environment",
+        "PUBLIC_BASE_URL": "public_base_url",
+        "SERVER_HOST": "server_host",
+        "LOG_LEVEL": "log_level",
+        "UMNICO_USER_ID": "umnico_user_id",
+    }.items():
+        if key in values:
+            kwargs[name] = values[key].strip()
+    for name in ("server_port", "panel_port"):
+        if name.upper() in values:
+            kwargs[name] = int(values[name.upper()])
+    for name in ("database_path", "knowledge_base_path"):
+        if name.upper() in values:
+            value = values[name.upper()].strip()
+            if not value:
+                raise ValueError(f"{name.upper()} must not be empty")
+            kwargs[name] = Path(value)
+    if "REGISTER_WEBHOOK" in values:
+        value = values["REGISTER_WEBHOOK"].strip().lower()
+        if value not in {"true", "false"}:
+            raise ValueError("REGISTER_WEBHOOK must be true or false")
+        kwargs["register_webhook"] = value == "true"
     return Settings(**kwargs)

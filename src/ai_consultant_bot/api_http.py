@@ -17,12 +17,20 @@ class APIError(Exception):
         super().__init__(f"{service}: {code}" + (f" (HTTP {status_code})" if status_code else ""))
 
 
+class DisabledAPITransport(httpx.AsyncBaseTransport):
+    """Fail before any network access, including with accidentally copied credentials."""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        raise APIError("integration", "external_api_disabled")
+
+
 def create_http_client(
     base_url: str,
     *,
     connect_timeout: float,
     read_timeout: float,
     transport: httpx.AsyncBaseTransport | None = None,
+    enabled: bool = True,
 ) -> httpx.AsyncClient:
     try:
         url = httpx.URL(base_url)
@@ -35,7 +43,7 @@ def create_http_client(
         timeout=httpx.Timeout(read_timeout, connect=connect_timeout),
         follow_redirects=False,
         trust_env=False,
-        transport=transport,
+        transport=transport if enabled else DisabledAPITransport(),
     )
 
 

@@ -23,7 +23,7 @@ def test_explicit_file_and_environment_precedence(tmp_path: Path) -> None:
     settings = load_settings(path, environ={"UMNICO_LOGIN": "process-login"})
     assert settings.umnico_login == "process-login"
     assert settings.umnico_password == " password "
-    assert settings.database_path == Settings().database_path
+    assert settings.database_path == Path("data/test.sqlite3")
 
 
 def test_missing_default_file_does_not_discover_files_or_mutate_environment(
@@ -54,12 +54,62 @@ def test_default_file_is_loaded_independently_of_working_directory(
     assert load_settings(environ={}).admin_token == "file-secret"
 
 
-def test_nonsecret_settings_are_only_configured_in_python(tmp_path: Path) -> None:
+def test_deployment_settings_are_loaded_and_other_settings_stay_in_python(tmp_path: Path) -> None:
     path = tmp_path / ".env"
-    path.write_text("SERVER_PORT=invalid\n", encoding="utf-8")
+    path.write_text("SERVER_PORT=8100\n", encoding="utf-8")
     settings = load_settings(path, environ={"DEFAULT_MODEL": "ignored/model"})
-    assert settings == Settings()
+    assert settings == Settings(server_port=8100)
     assert Settings(server_port=9000).server_port == 9000
+
+
+def test_server_file_and_process_overrides(tmp_path: Path) -> None:
+    path = tmp_path / "production.env"
+    path.write_text(
+        f"APP_ENV=production\nPUBLIC_BASE_URL=https://ai.example.org\n"
+        f"DATABASE_PATH={tmp_path.as_posix()}/production.sqlite3\n"
+        f"KNOWLEDGE_BASE_PATH={tmp_path.as_posix()}/knowledge\n"
+        "SERVER_PORT=8100\nPANEL_PORT=8501\nREGISTER_WEBHOOK=false\nADMIN_TOKEN=file-token\n",
+        encoding="utf-8",
+    )
+    settings = load_settings(
+        environ={
+            "AI_CONSULTANT_ENV_FILE": str(path),
+            "SERVER_PORT": "8105",
+            "ADMIN_TOKEN": "process-token",
+        }
+    )
+    assert settings.environment == "production"
+    assert settings.public_base_url == "https://ai.example.org"
+    assert settings.database_path == tmp_path / "production.sqlite3"
+    assert settings.server_port == 8105
+    assert settings.admin_token == "process-token"
+    assert not settings.register_webhook
+
+
+def test_server_does_not_fall_back_to_local_secrets(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("ADMIN_TOKEN=local-secret\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="AI_CONSULTANT_ENV_FILE"):
+        load_settings(environ={"APP_ENV": "staging"})
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "SERVER_PORT=invalid",
+        "REGISTER_WEBHOOK=yes",
+        "DATABASE_PATH=",
+        "APP_ENV=prod",
+        "PUBLIC_BASE_URL=http://ai.example.org",
+        "PUBLIC_BASE_URL=https://ai.example.org/private-token",
+        "APP_ENV=production",
+        "APP_ENV=staging",
+    ],
+)
+def test_invalid_deployment_file_fails_closed(tmp_path: Path, content: str) -> None:
+    path = tmp_path / "invalid.env"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_settings(path, environ={})
 
 
 def test_explicit_missing_file_raises(tmp_path: Path) -> None:

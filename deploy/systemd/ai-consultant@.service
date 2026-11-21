@@ -1,0 +1,34 @@
+[Unit]
+Description=AI consultant backend (%i)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ai-consultant-%i
+Group=ai-consultant-%i
+WorkingDirectory=/srv/ai-consultant/%i/current
+Environment=APP_ENV=%i
+Environment=AI_CONSULTANT_ENV_FILE=/etc/ai-consultant/%i.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HOME=/var/lib/ai-consultant/%i
+ExecStart=/srv/ai-consultant/%i/current/.venv/bin/python -m ai_consultant_bot
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+StateDirectory=ai-consultant/%i
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ai-consultant/%i
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

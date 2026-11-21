@@ -1,4 +1,4 @@
-"""Argument-free startup: settings, tunnel prompt, server, webhook registration."""
+"""Local tunnel or noninteractive server startup, with optional registration."""
 
 from __future__ import annotations
 
@@ -50,14 +50,20 @@ async def register_when_ready(
 async def serve_backend(server: uvicorn.Server) -> None:
     try:
         await server.serve()
+        if not server.started:
+            raise RuntimeError("Server did not start")
     except SystemExit:
         # Uvicorn exits on bind/lifespan failure; keep cleanup in our event loop.
         raise RuntimeError("Server startup failed") from None
 
 
-async def run_application(settings: Settings, tunnel_url: str) -> int:
+async def run_application(settings: Settings, tunnel_url: str | None = None) -> int:
     """Run the server before registering its callback; stop cleanly on failure."""
-    webhook_url = build_webhook_url(tunnel_url, settings.webhook_token)
+    webhook_url = (
+        build_webhook_url(tunnel_url or settings.public_base_url, settings.webhook_token)
+        if settings.register_webhook and settings.external_apis_enabled
+        else None
+    )
     server = uvicorn.Server(
         uvicorn.Config(
             create_app(settings),
@@ -69,8 +75,16 @@ async def run_application(settings: Settings, tunnel_url: str) -> int:
         )
     )
     server_task = asyncio.create_task(serve_backend(server))
-    registration_task = asyncio.create_task(register_when_ready(server, settings, webhook_url))
+    registration_task = (
+        asyncio.create_task(register_when_ready(server, settings, webhook_url))
+        if webhook_url is not None
+        else None
+    )
     try:
+        if registration_task is None:
+            logger.info("Запуск без регистрации webhook.")
+            await server_task
+            return 0
         done, _ = await asyncio.wait(
             (server_task, registration_task),
             return_when=asyncio.FIRST_COMPLETED,
@@ -89,8 +103,9 @@ async def run_application(settings: Settings, tunnel_url: str) -> int:
         logger.error("Не удалось запустить сервер или дождаться его готовности.")
         return 1
     finally:
-        registration_task.cancel()
-        await asyncio.gather(registration_task, return_exceptions=True)
+        if registration_task is not None:
+            registration_task.cancel()
+            await asyncio.gather(registration_task, return_exceptions=True)
         server.should_exit = True
         try:
             async with asyncio.timeout(settings.server_shutdown_timeout):
@@ -105,15 +120,21 @@ def main(settings: Settings | None = None, tunnel_url: str | None = None) -> int
     try:
         settings = load_settings() if settings is None else settings
     except (OSError, ValueError):
-        logger.error("Не удалось загрузить секреты: проверьте .env и пару login/password.")
+        logger.error("Не удалось загрузить конфигурацию: проверьте файл настроек и окружение.")
         return 1
     configure_logging(settings.log_level)
-    if not settings.webhook_token or not (settings.umnico_login or settings.umnico_api_key):
+    if settings.external_apis_enabled and (
+        not settings.webhook_token or not (settings.umnico_login or settings.umnico_api_key)
+    ):
         logger.error("Заполните WEBHOOK_TOKEN и учётные данные Umnico в .env.")
         return 1
     try:
-        build_webhook_url("https://tunnel.example.com", settings.webhook_token)
-        tunnel_url = prompt_tunnel_url(settings.webhook_token) if tunnel_url is None else tunnel_url
+        if settings.webhook_token:
+            build_webhook_url("https://tunnel.example.com", settings.webhook_token)
+        if settings.register_webhook and settings.external_apis_enabled:
+            tunnel_url = tunnel_url or settings.public_base_url
+            if not tunnel_url:
+                tunnel_url = prompt_tunnel_url(settings.webhook_token)
         return asyncio.run(run_application(settings, tunnel_url))
     except (EOFError, KeyboardInterrupt):
         logger.info("Запуск остановлен пользователем.")
