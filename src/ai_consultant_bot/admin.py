@@ -7,11 +7,12 @@ from typing import Any
 
 from ai_consultant_bot.config import Settings
 from ai_consultant_bot.storage import (
-    cancel_generation,
     conversation_chat_ids,
     get_conversation_lead,
     get_setting,
+    invalidate_conversation,
     open_database,
+    queue_unanswered_message,
     set_setting,
 )
 
@@ -27,19 +28,17 @@ def read_settings(settings: Settings) -> dict[str, Any]:
     with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
         return {
             "model": get_setting(connection, "model"),
-            "auto_reply": get_setting(connection, "auto_reply") == "1",
         }
 
 
-def update_settings(settings: Settings, model: str, auto_reply: bool) -> dict[str, Any]:
+def update_settings(settings: Settings, model: str) -> dict[str, Any]:
     model = model.strip()
     if not model or len(model) > settings.model_max_chars or any(c.isspace() for c in model):
         raise ValueError("Invalid model identifier")
     with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
         with connection:
             set_setting(connection, "model", model)
-            set_setting(connection, "auto_reply", str(int(auto_reply)))
-    return {"model": model, "auto_reply": auto_reply}
+    return {"model": model}
 
 
 def list_chats(settings: Settings, offset: int = 0) -> dict[str, Any]:
@@ -51,8 +50,6 @@ def list_chats(settings: Settings, offset: int = 0) -> dict[str, Any]:
             "ORDER BY julianday(p.occurred_at) DESC, p.chat_id DESC LIMIT 1) AS instagram_username, "
             "(SELECT text FROM messages m JOIN members g ON g.id = m.chat_id "
             "WHERE g.conversation_id = c.id ORDER BY m.id DESC LIMIT 1) AS last_text, "
-            "(SELECT COUNT(*) FROM drafts d JOIN members g ON g.id = d.chat_id "
-            "WHERE g.conversation_id = c.id AND d.status = 'pending') AS pending_drafts, "
             "(SELECT GROUP_CONCAT(DISTINCT source_type) FROM members g "
             "WHERE g.conversation_id = c.id) AS source_types, "
             "(SELECT MAX(paused) FROM members g WHERE g.conversation_id = c.id) "
@@ -112,11 +109,9 @@ def chat_detail(settings: Settings, chat_id: int, offset: int = 0) -> dict[str, 
             "ORDER BY julianday(m.occurred_at) DESC, m.id DESC LIMIT ? OFFSET ?",
             (*member_ids, settings.panel_page_size, offset),
         ).fetchall()
-        drafts = connection.execute(
-            "SELECT d.*, c.source_type FROM drafts d JOIN chats c ON c.id = d.chat_id "
-            f"WHERE d.chat_id IN ({placeholders}) ORDER BY d.id DESC LIMIT ?",
-            (*member_ids, settings.panel_page_size),
-        ).fetchall()
+        suggestion = connection.execute(
+            "SELECT * FROM suggestions WHERE conversation_id = ?", (member_ids[0],)
+        ).fetchone()
         attempts = connection.execute(
             "SELECT a.*, EXISTS (SELECT 1 FROM outgoing_receipts r JOIN messages m "
             "ON m.id = r.message_id WHERE r.custom_id = a.request_id "
@@ -133,7 +128,7 @@ def chat_detail(settings: Settings, chat_id: int, offset: int = 0) -> dict[str, 
             "message_total": connection.execute(
                 f"SELECT COUNT(*) FROM messages WHERE chat_id IN ({placeholders})", member_ids
             ).fetchone()[0],
-            "drafts": [dict(row) for row in drafts],
+            "suggestion": dict(suggestion) if suggestion else None,
             "attempts": [dict(row) for row in attempts],
             "reply_block_reason": reply_block_reason,
         }
@@ -143,12 +138,22 @@ def set_pause(settings: Settings, chat_id: int, paused: bool) -> dict[str, bool]
     with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
         with connection:
             connection.execute("BEGIN IMMEDIATE")
-            for member_id in conversation_chat_ids(connection, chat_id):
+            member_ids = conversation_chat_ids(connection, chat_id)
+            previous = connection.execute(
+                "SELECT MAX(paused) FROM chats WHERE id IN ("
+                + ",".join("?" for _ in member_ids)
+                + ")",
+                member_ids,
+            ).fetchone()[0]
+            if bool(previous) == paused:
+                return {"paused": paused}
+            invalidate_conversation(connection, chat_id)
+            for member_id in member_ids:
                 connection.execute(
                     "UPDATE chats SET paused = ? WHERE id = ?", (int(paused), member_id)
                 )
-                if paused:
-                    cancel_generation(connection, member_id)
+            if paused:
+                queue_unanswered_message(connection, chat_id)
     return {"paused": paused}
 
 

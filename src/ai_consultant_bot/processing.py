@@ -18,7 +18,6 @@ from ai_consultant_bot.storage import (
     claim_next_job,
     consultation_is_current,
     finish_consultation_job,
-    get_setting,
     interrupt_consultation,
     load_consultation_context,
     open_database,
@@ -35,34 +34,22 @@ def claim_consultation(settings: Settings) -> tuple[sqlite3.Row, dict] | None:
             job = claim_next_job(connection)
             if job is None:
                 return None
-            if not consultation_is_current(connection, job["id"]):
-                finish_consultation_job(connection, job["id"], "done")
+            if not consultation_is_current(connection, job["id"], job["generation"]):
+                finish_consultation_job(connection, job["id"], "done", job["generation"])
                 return job, {}
             return job, load_consultation_context(connection, job, settings)
 
 
-def finish_job(
-    settings: Settings,
-    job_id: int,
-    status: str,
-    draft_id: int | None = None,
-    draft_status: str | None = None,
-) -> None:
+def finish_job(settings: Settings, job: sqlite3.Row, status: str) -> None:
     with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
         with connection:
-            finish_consultation_job(
-                connection,
-                job_id,
-                status,
-                draft_id=draft_id,
-                draft_status=draft_status,
-            )
+            finish_consultation_job(connection, job["id"], status, job["generation"])
 
 
-def finish_interrupted_job(settings: Settings, job_id: int, draft_id: int | None) -> None:
+def finish_interrupted_job(settings: Settings, job: sqlite3.Row) -> None:
     with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
         with connection:
-            interrupt_consultation(connection, job_id, draft_id)
+            interrupt_consultation(connection, job["id"], job["generation"])
 
 
 async def process_next_job(
@@ -77,7 +64,6 @@ async def process_next_job(
     job, context = claimed
     if not context:
         return True
-    draft_id = None
     try:
         query = " ".join(
             item["text"] for item in context["history"] if item["direction"] == "incoming"
@@ -133,15 +119,14 @@ async def process_next_job(
         with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
-                draft_id = save_consultation(connection, job, result.lead, result.reply)
-                auto_reply = get_setting(connection, "auto_reply") == "1"
-                if draft_id is not None and (not auto_reply or context["source_type"] == "comment"):
-                    finish_consultation_job(connection, job["id"], "done")
-        if draft_id is None:
+                paused = save_consultation(connection, job, result.lead, result.reply)
+                if paused is not None and (paused or context["source_type"] == "comment"):
+                    finish_consultation_job(connection, job["id"], "done", job["generation"])
+        if paused is None:
             logger.info("Консультация устарела до сохранения ответа.")
             return True
-        if not auto_reply or context["source_type"] == "comment":
-            logger.info("Консультация и заявка сохранены; черновик ожидает одобрения.")
+        if paused or context["source_type"] == "comment":
+            logger.info("Консультация и заявка сохранены.")
             return True
         try:
             attempt = await send_text(
@@ -151,29 +136,18 @@ async def process_next_job(
                 text=result.reply,
                 request_id=f"consultation:{job['id']}",
                 job_id=job["id"],
+                generation=job["generation"],
             )
         except APIError as error:
-            if error.code in {"consultation_superseded", "auto_reply_disabled"}:
-                finish_job(
-                    settings,
-                    job["id"],
-                    "done",
-                    draft_id,
-                    "stale" if error.code == "consultation_superseded" else "pending",
-                )
+            if error.code == "consultation_superseded":
+                finish_job(settings, job, "done")
                 return True
             raise
         status = attempt["status"]
-        finish_job(
-            settings,
-            job["id"],
-            "unknown" if status == "unknown" else "done",
-            draft_id,
-            status if status in {"sent", "unknown"} else "failed",
-        )
+        finish_job(settings, job, "unknown" if status == "unknown" else "done")
         return True
     except (Exception, asyncio.CancelledError):
-        finish_interrupted_job(settings, job["id"], draft_id)
+        finish_interrupted_job(settings, job)
         raise
 
 

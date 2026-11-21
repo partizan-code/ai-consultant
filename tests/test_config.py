@@ -17,13 +17,12 @@ def test_explicit_file_and_environment_precedence(tmp_path: Path) -> None:
     path = tmp_path / "settings.txt"
     path.write_text(
         'DEFAULT_MODEL=file/model\nUMNICO_LOGIN=test\nUMNICO_PASSWORD=" password "\n'
-        "AUTO_REPLY=true\nDATABASE_PATH=data/test.sqlite3\n",
+        "DATABASE_PATH=data/test.sqlite3\n",
         encoding="utf-8",
     )
     settings = load_settings(path, environ={"UMNICO_LOGIN": "process-login"})
     assert settings.umnico_login == "process-login"
     assert settings.umnico_password == " password "
-    assert settings.auto_reply is False
     assert settings.database_path == Settings().database_path
 
 
@@ -57,10 +56,10 @@ def test_default_file_is_loaded_independently_of_working_directory(
 
 def test_nonsecret_settings_are_only_configured_in_python(tmp_path: Path) -> None:
     path = tmp_path / ".env"
-    path.write_text("SERVER_PORT=invalid\nAUTO_REPLY=true\n", encoding="utf-8")
+    path.write_text("SERVER_PORT=invalid\n", encoding="utf-8")
     settings = load_settings(path, environ={"DEFAULT_MODEL": "ignored/model"})
     assert settings == Settings()
-    assert Settings(server_port=9000, auto_reply=True).server_port == 9000
+    assert Settings(server_port=9000).server_port == 9000
 
 
 def test_explicit_missing_file_raises(tmp_path: Path) -> None:
@@ -90,6 +89,9 @@ def test_explicit_missing_file_raises(tmp_path: Path) -> None:
         {"panel_refresh_interval": 0},
         {"panel_refresh_interval": float("nan")},
         {"panel_refresh_interval": float("inf")},
+        {"panel_history_refresh_interval": 0},
+        {"panel_history_refresh_interval": float("nan")},
+        {"panel_history_refresh_interval": float("inf")},
         {"history_context_messages": 0},
         {"history_context_chars": 0},
         {"knowledge_file_max_bytes": 0},

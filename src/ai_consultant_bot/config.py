@@ -27,7 +27,6 @@ class Settings:
     knowledge_base_path: Path = Path("knowledge_base")
     log_level: str = "INFO"
     default_model: str = "openai/gpt-6.1-sol"
-    auto_reply: bool = False
     umnico_base_url: str = "https://api.umnico.com"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     umnico_login: str = field(default="", repr=False)
@@ -68,6 +67,7 @@ class Settings:
     panel_page_size: int = 50
     panel_request_timeout: float = 30.0
     panel_refresh_interval: float = 10.0
+    panel_history_refresh_interval: float = 3.0
     model_max_chars: int = 200
 
     def __post_init__(self) -> None:
@@ -83,6 +83,7 @@ class Settings:
             "processing_poll_interval",
             "panel_request_timeout",
             "panel_refresh_interval",
+            "panel_history_refresh_interval",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:

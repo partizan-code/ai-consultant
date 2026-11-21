@@ -69,7 +69,7 @@ def rows(settings: Settings, table: str) -> list[dict]:
         "chats",
         "jobs",
         "message_context",
-        "drafts",
+        "suggestions",
         "outgoing_attempts",
         "outgoing_receipts",
         "chat_profiles",
@@ -248,23 +248,22 @@ def test_outgoing_and_empty_text_do_not_create_jobs(settings: Settings) -> None:
     assert rows(settings, "jobs") == []
 
 
-def test_incoming_marks_drafts_stale_and_jobs_are_serialized(settings: Settings) -> None:
+def test_incoming_removes_suggestion_and_jobs_are_serialized_on_pause(settings: Settings) -> None:
     ingest_event(settings, incoming())
     with open_database(settings.database_path, timeout=1) as connection, connection:
-        connection.execute("INSERT INTO drafts(chat_id, message_id, text) VALUES (1, 1, 'draft')")
+        connection.execute(
+            "INSERT INTO suggestions(conversation_id, message_id, text) VALUES (1, 1, 'text')"
+        )
     ingest_event(settings, incoming("second"))
-    assert rows(settings, "drafts")[0]["status"] == "stale"
+    assert rows(settings, "suggestions") == []
     with open_database(settings.database_path, timeout=1) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        assert claim_next_job(connection)["message_id"] == 1
-    with open_database(settings.database_path, timeout=1) as connection, connection:
-        connection.execute("BEGIN IMMEDIATE")
-        assert claim_next_job(connection) is None
-        connection.execute("UPDATE jobs SET status = 'done' WHERE id = 1")
-        connection.execute("UPDATE chats SET paused = 1")
-        assert claim_next_job(connection) is None
-        connection.execute("UPDATE chats SET paused = 0")
         assert claim_next_job(connection)["message_id"] == 2
+    with open_database(settings.database_path, timeout=1) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        assert claim_next_job(connection) is None
+        connection.execute("UPDATE jobs SET status = 'done' WHERE id = 2")
+        assert claim_next_job(connection) is None
 
 
 @pytest.mark.parametrize("end_source,end_cursor", [(0, 0), (0, None), (255, None)])

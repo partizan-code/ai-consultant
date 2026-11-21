@@ -74,11 +74,13 @@ async def api(settings: Settings, handler=no_network):
             yield client
 
 
-def make_draft(settings: Settings, source: str = "message") -> None:
+def make_suggestion(settings: Settings, source: str = "message") -> None:
     ingest_event(settings, event(source=source))
     with open_database(settings.database_path, timeout=1) as connection, connection:
         connection.execute("UPDATE jobs SET status = 'done'")
-        connection.execute("INSERT INTO drafts(chat_id, message_id, text) VALUES (1, 1, 'Ответ')")
+        connection.execute(
+            "INSERT INTO suggestions(conversation_id, message_id, text) VALUES (1, 1, 'Ответ')"
+        )
         save_lead(connection, 1, Lead(name="Анна", phone="+375290000000"))
 
 
@@ -86,12 +88,11 @@ def make_draft(settings: Settings, source: str = "message") -> None:
     "method,path,body",
     [
         ("GET", "settings", None),
-        ("PUT", "settings", {"model": "other/model", "auto_reply": True}),
+        ("PUT", "settings", {"model": "other/model"}),
         ("GET", "chats", None),
         ("GET", "chats/1", None),
         ("GET", "status", None),
         ("POST", "chats/1/pause", {"paused": True}),
-        ("POST", "chats/1/drafts/1/approve", None),
     ],
 )
 @pytest.mark.parametrize("token,code", [("synthetic-admin", 401), ("", 503)])
@@ -107,7 +108,7 @@ def test_admin_auth(
 
 
 def test_chat_lead_comment_and_pagination(settings: Settings) -> None:
-    make_draft(settings, source="comment")
+    make_suggestion(settings, source="comment")
     ingest_event(settings, event("second", source="comment"))
     ingest_event(settings, event("third", source="comment"))
 
@@ -120,7 +121,7 @@ def test_chat_lead_comment_and_pagination(settings: Settings) -> None:
             assert data["reply_block_reason"] == "comment_private_reply_unverified"
             assert data["message_total"] == 3 and len(data["messages"]) == 2
             assert data["messages"][0]["post_description"] == "Наш диван"
-            assert data["drafts"][0]["status"] == "stale"
+            assert data["suggestion"] is None
             older = (await client.get("/admin/chats/1?offset=2", headers=HEADERS)).json()
             assert len(older["messages"]) == 1 and older["messages"][0]["external_id"] == "first"
             assert (await client.get("/admin/chats/999", headers=HEADERS)).status_code == 404
@@ -130,7 +131,7 @@ def test_chat_lead_comment_and_pagination(settings: Settings) -> None:
 
 
 def test_instagram_profile_does_not_replace_lead_name(settings: Settings) -> None:
-    make_draft(settings)
+    make_suggestion(settings)
     with open_database(settings.database_path, timeout=1) as connection, connection:
         # A database from the previous version may contain an unused name cache.
         connection.execute(
@@ -150,7 +151,7 @@ def test_instagram_profile_does_not_replace_lead_name(settings: Settings) -> Non
             detail = (await client.get("/admin/chats/1", headers=HEADERS)).json()
             assert detail["chat"]["instagram_username"] == "anna.instagram"
             assert detail["lead"]["name"] == "Анна"
-            assert len(detail["drafts"]) == 1 and detail["drafts"][0]["status"] == "pending"
+            assert detail["suggestion"]["text"] == "Ответ"
 
     asyncio.run(run())
     with open_database(settings.database_path, timeout=1) as connection:
@@ -162,13 +163,13 @@ def test_instagram_profile_does_not_replace_lead_name(settings: Settings) -> Non
 @pytest.mark.parametrize(
     "body",
     [
-        {"model": "", "auto_reply": False},
-        {"model": "bad model", "auto_reply": True},
-        {"model": "a" * 201, "auto_reply": False},
-        {"model": "a", "auto_reply": "false"},
-        {"model": "a", "auto_reply": 1},
-        {"model": "a"},
-        {"model": "a", "auto_reply": False, "token": "x"},
+        {"model": ""},
+        {"model": "bad model"},
+        {"model": "a" * 201},
+        {"model": 1},
+        {"model": None},
+        {},
+        {"model": "a", "token": "x"},
         [],
     ],
 )
@@ -190,9 +191,9 @@ def test_model_persists_and_next_generation_uses_it(settings: Settings) -> None:
             result = await client.put(
                 "/admin/settings",
                 headers=HEADERS,
-                json={"model": " chosen/model ", "auto_reply": False},
+                json={"model": " chosen/model "},
             )
-            assert result.json() == {"model": "chosen/model", "auto_reply": False}
+            assert result.json() == {"model": "chosen/model"}
         # Restart cannot reset the saved settings.
         async with api(settings) as client:
             assert (await client.get("/admin/settings", headers=HEADERS)).json()[
@@ -223,101 +224,53 @@ def test_model_persists_and_next_generation_uses_it(settings: Settings) -> None:
             UmnicoClient(settings, transport=httpx.MockTransport(no_network)) as umnico,
         ):
             assert await process_next_job(settings, knowledge, router, umnico)
-        assert chat_detail(settings, 1)["drafts"][0]["status"] == "pending"
+        assert chat_detail(settings, 1)["suggestion"]["text"]
 
     asyncio.run(run())
 
 
 @pytest.mark.parametrize("outcome", ["sent", "unknown", "failed"])
-def test_approval_replay_and_late_receipt(settings: Settings, outcome: str) -> None:
-    make_draft(settings)
+def test_manual_replay_and_late_receipt(settings: Settings, outcome: str) -> None:
+    make_suggestion(settings)
     calls = []
 
     def handler(request):
         calls.append(request)
-        assert json.loads(request.content)["customId"] == "draft:1"
+        assert chat_detail(settings, 1)["chat"]["paused"] == 1
+        assert json.loads(request.content)["customId"] == "manual"
         if outcome == "unknown":
             raise httpx.ReadTimeout("synthetic", request=request)
-        return (
-            httpx.Response(200, json=[{"messageId": "sent"}])
-            if outcome == "sent"
-            else httpx.Response(400)
-        )
+        return httpx.Response(200 if outcome == "sent" else 400, json=[{"messageId": "sent"}])
 
     async def run():
         async with api(settings, handler) as client:
-            url = "/admin/chats/1/drafts/1/approve"
-            first = await client.post(url, headers=HEADERS)
+            url = "/admin/chats/1/send-text"
+            body = {"request_id": "manual", "text": "Ответ"}
+            first = await client.post(url, headers=HEADERS, json=body)
             assert first.status_code == 200 and first.json()["status"] == outcome
-            assert (await client.post(url, headers=HEADERS)).json() == first.json()
+            assert (await client.post(url, headers=HEADERS, json=body)).json() == first.json()
             data = chat_detail(settings, 1)
-            assert data["drafts"][0]["status"] == outcome and data["chat"]["paused"] == 0
+            assert data["chat"]["paused"] == 1
+            assert (data["suggestion"] is None) == (outcome == "sent")
             if outcome == "unknown":
                 denied = await client.post(
-                    "/admin/chats/1/send-text",
-                    headers=HEADERS,
-                    json={"request_id": "new", "text": "Ещё"},
+                    url, headers=HEADERS, json={"request_id": "new", "text": "Ещё"}
                 )
                 assert denied.json()["error_code"] == "unresolved_send"
                 receipt = event("sent")
                 receipt["type"] = "message.outgoing"
-                receipt["message"].update(incoming=False, customId="draft:1")
+                receipt["message"].update(incoming=False, customId="manual")
                 receipt["message"]["message"]["text"] = "Ответ"
                 ingest_event(settings, receipt)
-                assert (await client.post(url, headers=HEADERS)).json()["status"] == "sent"
-                assert chat_detail(settings, 1)["drafts"][0]["status"] == "sent"
-            data = (await client.get("/admin/status", headers=HEADERS)).json()
-            assert len(data["calls"]) == 1 and data["calls"][0]["operation"] == "send_text"
-            assert (
-                data["last_error"] is None if outcome == "sent" else data["last_error"] is not None
-            )
+                assert (await client.post(url, headers=HEADERS, json=body)).json()[
+                    "status"
+                ] == "sent"
+                assert chat_detail(settings, 1)["suggestion"] is None
+            status = (await client.get("/admin/status", headers=HEADERS)).json()
+            assert status["calls"][0]["operation"] == "send_text"
 
     asyncio.run(run())
     assert len(calls) == 1
-
-
-@pytest.mark.parametrize("change", ["new_message", "pause", "comment"])
-def test_approval_refuses_ineligible_draft_without_network(settings: Settings, change: str) -> None:
-    make_draft(settings, "comment" if change == "comment" else "message")
-    if change == "new_message":
-        ingest_event(settings, event("new"))
-    if change == "pause":
-        set_pause(settings, 1, True)
-
-    async def run():
-        async with api(settings) as client:
-            response = await client.post("/admin/chats/1/drafts/1/approve", headers=HEADERS)
-            if change == "comment":
-                assert response.json()["error_code"] == "comment_private_reply_unverified"
-                assert response.json()["status"] == "blocked"
-            else:
-                assert response.status_code == 409
-            assert (
-                await client.post("/admin/chats/2/drafts/1/approve", headers=HEADERS)
-            ).status_code == 404
-
-    asyncio.run(run())
-
-
-def test_new_message_during_route_resolution_invalidates_approval(settings: Settings) -> None:
-    make_draft(settings)
-    with open_database(settings.database_path, timeout=1) as connection, connection:
-        connection.execute("UPDATE message_context SET source_real_id = NULL")
-
-    def handler(request):
-        assert request.method == "GET"
-        ingest_event(settings, event("new"))
-        return httpx.Response(
-            200, json=[{"id": "sender", "type": "message", "saId": 88, "realId": 255}]
-        )
-
-    async def run():
-        async with api(settings, handler) as client:
-            result = await client.post("/admin/chats/1/drafts/1/approve", headers=HEADERS)
-            assert result.status_code == 409
-            assert chat_detail(settings, 1)["attempts"] == []
-
-    asyncio.run(run())
 
 
 @pytest.mark.parametrize("action", ["pause_resume", "manual"])
@@ -382,14 +335,16 @@ def test_pause_or_manual_answer_invalidates_generation(settings: Settings, actio
             ):
                 assert await process_next_job(settings, KnowledgeBase(settings), router, umnico)
             data = chat_detail(settings, 1)
-            assert data["drafts"] == [] and bool(data["chat"]["paused"]) == (action == "manual")
+            assert data["suggestion"] is None and bool(data["chat"]["paused"]) == (
+                action == "manual"
+            )
 
     asyncio.run(run())
     assert len(sent) == (1 if action == "manual" else 0)
 
 
-def test_pause_api_validates_and_preserves_pending_draft(settings: Settings) -> None:
-    make_draft(settings)
+def test_pause_api_validates_and_activation_clears_suggestion(settings: Settings) -> None:
+    make_suggestion(settings)
 
     async def run():
         async with api(settings) as client:
@@ -403,7 +358,7 @@ def test_pause_api_validates_and_preserves_pending_draft(settings: Settings) -> 
             assert (await client.post(url, headers=HEADERS, json={"paused": False})).json() == {
                 "paused": False
             }
-            assert chat_detail(settings, 1)["drafts"][0]["status"] == "pending"
+            assert chat_detail(settings, 1)["suggestion"] is None
             assert (
                 await client.post("/admin/chats/999/pause", headers=HEADERS, json={"paused": True})
             ).status_code == 404
@@ -412,11 +367,11 @@ def test_pause_api_validates_and_preserves_pending_draft(settings: Settings) -> 
 
 
 def test_manual_cannot_claim_internal_request_namespace(settings: Settings) -> None:
-    make_draft(settings)
+    make_suggestion(settings)
 
     async def run():
         async with api(settings) as client:
-            for request_id in ("draft:1", "consultation:1"):
+            for request_id in ("consultation:1",):
                 response = await client.post(
                     "/admin/chats/1/send-text",
                     headers=HEADERS,
@@ -435,7 +390,7 @@ def test_one_conversation_keeps_routes_and_sends_manual_reply_in_direct(
     first_source, second_source = (
         ("comment", "message") if comment_first else ("message", "comment")
     )
-    make_draft(settings, first_source)
+    make_suggestion(settings, first_source)
     second = event("second", second_source)
     second["message"]["source"].update(id="second-source", realId=256)
     second["message"]["datetime"] = "2026-11-20T10:01:00Z"
@@ -444,14 +399,13 @@ def test_one_conversation_keeps_routes_and_sends_manual_reply_in_direct(
     ingest_event(settings, second)
     with open_database(settings.database_path, timeout=1) as connection, connection:
         connection.execute(
-            "INSERT INTO drafts(chat_id, message_id, text) VALUES (2, 2, 'Новый ответ')"
+            "INSERT INTO suggestions(conversation_id, message_id, text) VALUES (1, 2, 'Новый ответ')"
         )
         save_lead(connection, 2, Lead(city="Минск"))
     listing = list_chats(settings)
     assert listing["total"] == 1
     item = listing["items"][0]
     assert item["id"] == 1 and item["instagram_username"] == "customer"
-    assert item["pending_drafts"] == 1
     assert set(item["source_types"].split(",")) == {"message", "comment"}
     detail = chat_detail(settings, 1)
     assert detail == chat_detail(settings, 2)  # Old source links open the same conversation.
@@ -482,7 +436,7 @@ def test_one_conversation_keeps_routes_and_sends_manual_reply_in_direct(
     assert len(sent) == 1
     detail = chat_detail(settings, 1)
     assert detail["attempts"][0]["chat_id"] == direct_id
-    assert all(draft["status"] == "stale" for draft in detail["drafts"])
+    assert detail["suggestion"] is None
     with open_database(settings.database_path, timeout=1) as connection:
         assert [row[0] for row in connection.execute("SELECT paused FROM chats")] == [1, 1]
         assert {row[0] for row in connection.execute("SELECT status FROM jobs")} == {"done"}
@@ -568,3 +522,35 @@ def test_import_enriches_old_comment_photo_in_combined_conversation(settings: Se
     assert detail["messages"][1]["post_photo_url"] == "https://example.test/old-post.jpg"
     with open_database(settings.database_path, timeout=1) as connection:
         assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 2
+
+
+def test_manual_pauses_before_route_lookup_and_send(settings: Settings) -> None:
+    ingest_event(settings, event())
+    set_pause(settings, 1, False)
+    with open_database(settings.database_path, timeout=1) as connection, connection:
+        connection.execute("UPDATE message_context SET source_real_id = NULL")
+    calls = []
+
+    def handler(request):
+        calls.append(request.method)
+        assert chat_detail(settings, 1)["chat"]["paused"] == 1
+        if request.method == "GET":
+            # Even an intervening activation must not make a manual send leave the bot active.
+            set_pause(settings, 1, False)
+            return httpx.Response(
+                200, json=[{"id": "sender", "type": "message", "saId": 88, "realId": 255}]
+            )
+        return httpx.Response(200, json=[{"messageId": "sent"}])
+
+    async def run():
+        async with api(settings, handler) as client:
+            result = await client.post(
+                "/admin/chats/1/send-text",
+                headers=HEADERS,
+                json={"request_id": "manual", "text": "Ответ"},
+            )
+            assert result.json()["status"] == "sent"
+
+    asyncio.run(run())
+    assert calls == ["GET", "POST"]
+    assert chat_detail(settings, 1)["chat"]["paused"] == 1

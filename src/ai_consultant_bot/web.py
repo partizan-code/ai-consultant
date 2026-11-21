@@ -29,7 +29,6 @@ from ai_consultant_bot.api_http import APIError
 from ai_consultant_bot.config import Settings
 from ai_consultant_bot.knowledge import KnowledgeBase
 from ai_consultant_bot.messaging import (
-    approve_draft,
     import_conversation_history,
     ingest_event,
     send_text,
@@ -121,15 +120,12 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
         payload = await read_payload(request, settings.webhook_max_bytes)
         if (
             not isinstance(payload, dict)
-            or set(payload) != {"model", "auto_reply"}
+            or set(payload) != {"model"}
             or not isinstance(payload["model"], str)
-            or type(payload["auto_reply"]) is not bool
         ):
-            raise HTTPException(400, "Model and boolean auto_reply are required")
+            raise HTTPException(400, "Model is required")
         try:
-            return await run_in_threadpool(
-                update_settings, settings, payload["model"], payload["auto_reply"]
-            )
+            return await run_in_threadpool(update_settings, settings, payload["model"])
         except ValueError:
             raise HTTPException(400, "Invalid model identifier") from None
 
@@ -157,16 +153,6 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
             return await run_in_threadpool(set_pause, settings, chat_id, payload["paused"])
         except LookupError:
             raise HTTPException(404, "Chat not found") from None
-
-    @app.post(
-        "/admin/chats/{chat_id}/drafts/{draft_id}/approve", dependencies=[Depends(require_admin)]
-    )
-    async def approve(chat_id: int, draft_id: int, request: Request) -> dict[str, Any]:
-        try:
-            result = await approve_draft(settings, request.app.state.umnico, chat_id, draft_id)
-        except LookupError:
-            raise HTTPException(404, "Draft not found") from None
-        return {key: result[key] for key in ("request_id", "status", "error_code")}
 
     @app.get("/admin/status", dependencies=[Depends(require_admin)])
     def status() -> dict[str, Any]:

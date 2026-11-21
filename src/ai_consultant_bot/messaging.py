@@ -12,9 +12,9 @@ from ai_consultant_bot.config import Settings
 from ai_consultant_bot.events import parse_event, parse_history_message
 from ai_consultant_bot.storage import (
     cancel_generation,
+    clear_answered_suggestion,
     consultation_is_current,
     conversation_chat_ids,
-    get_setting,
     open_database,
     reconcile_outgoing_attempt,
     record_api_call,
@@ -193,7 +193,7 @@ async def send_text(
     text: str,
     request_id: str,
     job_id: int | None = None,
-    draft_id: int | None = None,
+    generation: int | None = None,
 ) -> dict[str, Any]:
     """Persist uncertainty BEFORE I/O; never retry a request ID.
 
@@ -206,13 +206,8 @@ async def send_text(
         or not request_id.strip()
         or request_id != request_id.strip()
         or len(request_id) > 128
-        or (job_id is not None and draft_id is not None)
-        or (
-            job_id is None
-            and draft_id is None
-            and request_id.startswith(("consultation:", "draft:"))
-        )
-        or (draft_id is not None and request_id != f"draft:{draft_id}")
+        or (job_id is None and request_id.startswith("consultation:"))
+        or (job_id is not None and (generation is None or request_id != f"consultation:{job_id}"))
     ):
         raise ValueError("Text and request ID are required")
     # A replay must return durable state even if a route lookup would now fail.
@@ -233,6 +228,13 @@ async def send_text(
             member_ids,
         ).fetchone():
             raise APIError("umnico", "unresolved_send")
+    if job_id is None:
+        with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for member_id in conversation_chat_ids(connection, chat_id):
+                    connection.execute("UPDATE chats SET paused = 1 WHERE id = ?", (member_id,))
+                    cancel_generation(connection, member_id)
     route = get_chat_route(settings, chat_id)
     blocked = None
     if route["source_type"] == "comment":
@@ -266,60 +268,43 @@ async def send_text(
                 member_ids,
             ).fetchone():
                 raise APIError("umnico", "unresolved_send")
-            if (job_id is not None or draft_id is not None) and connection.execute(
-                "SELECT 1 FROM jobs j JOIN messages m ON m.id = j.message_id "
-                f"WHERE m.chat_id IN ({placeholders}) AND j.status IN ('processing', 'unknown') "
-                "AND (? IS NULL OR j.id != ?)",
-                (*member_ids, job_id, job_id),
-            ).fetchone():
-                raise APIError("umnico", "chat_processing")
-            if draft_id is not None:
-                current = connection.execute(
-                    "SELECT 1 FROM drafts d JOIN chats c ON c.id = d.chat_id "
-                    "WHERE d.id = ? AND d.chat_id = ? AND d.text = ? AND d.status = 'pending' "
-                    "AND c.paused = 0 AND NOT EXISTS (SELECT 1 FROM chats pc "
-                    "WHERE pc.account_id = c.account_id AND pc.lead_id = c.lead_id "
-                    "AND pc.integration_id = c.integration_id AND pc.paused = 1) "
-                    "AND NOT EXISTS (SELECT 1 FROM messages newer "
-                    "JOIN chats nc ON nc.id = newer.chat_id "
-                    "WHERE nc.account_id = c.account_id AND nc.lead_id = c.lead_id "
-                    "AND nc.integration_id = c.integration_id AND newer.direction = 'incoming' "
-                    "AND newer.imported = 0 AND newer.id > d.message_id)",
-                    (draft_id, chat_id, text),
+            if (
+                job_id is not None
+                and connection.execute(
+                    "SELECT 1 FROM jobs j JOIN messages m ON m.id = j.message_id "
+                    f"WHERE m.chat_id IN ({placeholders}) AND j.status IN ('processing', 'unknown') "
+                    "AND (? IS NULL OR j.id != ?)",
+                    (*member_ids, job_id, job_id),
                 ).fetchone()
-                if current is None:
-                    raise APIError("umnico", "draft_not_current_or_paused")
+            ):
+                raise APIError("umnico", "chat_processing")
             if job_id is not None:
                 owner = connection.execute(
                     "SELECT 1 FROM jobs j JOIN messages m ON m.id = j.message_id "
                     "WHERE j.id = ? AND m.chat_id = ?",
                     (job_id, chat_id),
                 ).fetchone()
-                if owner is None or not consultation_is_current(connection, job_id):
+                if owner is None or not consultation_is_current(connection, job_id, generation):
                     raise APIError("umnico", "consultation_superseded")
-                if get_setting(connection, "auto_reply") != "1":
-                    raise APIError("umnico", "auto_reply_disabled")
-            connection.execute(
-                "INSERT INTO outgoing_attempts(request_id, chat_id, text, status, error_code) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (request_id, chat_id, text, "blocked" if blocked else "unknown", blocked),
-            )
-            if not blocked and draft_id is not None:
-                connection.execute("UPDATE drafts SET status = 'unknown' WHERE id = ?", (draft_id,))
-            if not blocked and job_id is None and draft_id is None:
-                for member_id in conversation_chat_ids(connection, chat_id):
+                if connection.execute(
+                    f"SELECT 1 FROM chats WHERE id IN ({placeholders}) AND paused = 1", member_ids
+                ).fetchone():
+                    raise APIError("umnico", "consultation_superseded")
+            latest = connection.execute(
+                f"SELECT MAX(id) FROM messages WHERE chat_id IN ({placeholders}) "
+                "AND direction = 'incoming' AND imported = 0",
+                member_ids,
+            ).fetchone()[0]
+            # Invalidate any generation claimed during a manual route lookup too.
+            if job_id is None:
+                for member_id in member_ids:
                     connection.execute("UPDATE chats SET paused = 1 WHERE id = ?", (member_id,))
                     cancel_generation(connection, member_id)
-                    connection.execute(
-                        "UPDATE jobs SET status = 'done' WHERE status = 'pending' "
-                        "AND message_id IN (SELECT id FROM messages WHERE chat_id = ?)",
-                        (member_id,),
-                    )
-                    connection.execute(
-                        "UPDATE drafts SET status = 'stale' WHERE chat_id = ? "
-                        "AND status IN ('pending', 'approved')",
-                        (member_id,),
-                    )
+            connection.execute(
+                "INSERT INTO outgoing_attempts(request_id, chat_id, message_id, text, status, error_code) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (request_id, chat_id, latest, text, "blocked" if blocked else "unknown", blocked),
+            )
             if not blocked:
                 reconcile_outgoing_attempt(connection, request_id)
                 confirmed = connection.execute(
@@ -367,11 +352,8 @@ async def send_text(
                         "SELECT * FROM outgoing_attempts WHERE request_id = ?", (request_id,)
                     ).fetchone()
                 )
-                if draft_id is not None:
-                    connection.execute(
-                        "UPDATE drafts SET status = ? WHERE id = ? AND status = 'unknown'",
-                        (result["status"], draft_id),
-                    )
+                if result["status"] == "sent":
+                    clear_answered_suggestion(connection, request_id)
                 record_api_call(
                     connection,
                     "send_text",
@@ -384,22 +366,3 @@ async def send_text(
         else:
             logger.warning("Отправка завершена со статусом {}.", result["status"])
         return result
-
-
-async def approve_draft(
-    settings: Settings, client: UmnicoClient, chat_id: int, draft_id: int
-) -> dict[str, Any]:
-    with open_database(settings.database_path, timeout=settings.database_timeout) as connection:
-        draft = connection.execute(
-            "SELECT text FROM drafts WHERE id = ? AND chat_id = ?", (draft_id, chat_id)
-        ).fetchone()
-        if draft is None:
-            raise LookupError("Draft not found")
-    return await send_text(
-        settings,
-        client,
-        chat_id=chat_id,
-        text=draft["text"],
-        request_id=f"draft:{draft_id}",
-        draft_id=draft_id,
-    )

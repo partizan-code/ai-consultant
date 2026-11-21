@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS chats (
     integration_id TEXT NOT NULL,
     source_type TEXT NOT NULL,
     source_id TEXT NOT NULL,
-    paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
+    paused INTEGER NOT NULL DEFAULT 1 CHECK (paused IN (0, 1)),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (account_id, lead_id, integration_id, source_type, source_id)
 );
@@ -57,18 +57,16 @@ CREATE TABLE IF NOT EXISTS leads (
     purchase_time TEXT,
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
-CREATE TABLE IF NOT EXISTS drafts (
-    id INTEGER PRIMARY KEY,
-    chat_id INTEGER NOT NULL REFERENCES chats(id),
+CREATE TABLE IF NOT EXISTS suggestions (
+    conversation_id INTEGER PRIMARY KEY REFERENCES chats(id),
     message_id INTEGER NOT NULL REFERENCES messages(id),
     text TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'approved', 'stale', 'sent', 'failed', 'unknown')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY,
     message_id INTEGER NOT NULL UNIQUE REFERENCES messages(id),
+    generation INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'processing', 'done', 'failed', 'unknown')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -95,6 +93,7 @@ CREATE TABLE IF NOT EXISTS message_context (
 CREATE TABLE IF NOT EXISTS outgoing_attempts (
     request_id TEXT PRIMARY KEY,
     chat_id INTEGER NOT NULL REFERENCES chats(id),
+    message_id INTEGER REFERENCES messages(id),
     text TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('unknown', 'sent', 'failed', 'blocked')),
     error_code TEXT,
@@ -153,11 +152,14 @@ def open_database(path: Path, *, timeout: float) -> Generator[sqlite3.Connection
 
 def initialize_database(connection: sqlite3.Connection, settings: Settings) -> None:
     """Initialize a new database idempotently without overwriting saved settings."""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
+    if columns and "generation" not in columns:
+        raise RuntimeError("Stop backend and run python -m ai_consultant_bot.migrate_suggestions")
     connection.executescript(SCHEMA)
     with connection:
         connection.executemany(
             "INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
-            [("model", settings.default_model), ("auto_reply", str(int(settings.auto_reply)))],
+            [("model", settings.default_model)],
         )
 
 
@@ -169,9 +171,9 @@ def get_setting(connection: sqlite3.Connection, key: str) -> str:
 
 
 def set_setting(connection: sqlite3.Connection, key: str, value: str) -> None:
-    if key not in {"model", "auto_reply"}:
+    if key != "model":
         raise ValueError("Unsupported persistent setting")
-    if not value.strip() or (key == "auto_reply" and value not in {"0", "1"}):
+    if not value.strip():
         raise ValueError("Invalid persistent setting value")
     connection.execute(
         "INSERT INTO settings(key, value) VALUES (?, ?) "
@@ -185,7 +187,7 @@ def save_chat(connection: sqlite3.Connection, key: ChatKey) -> int:
     connection.execute(
         "INSERT INTO chats(account_id, lead_id, integration_id, source_type, source_id, paused) "
         "VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(paused) FROM chats "
-        "WHERE account_id = ? AND lead_id = ? AND integration_id = ?), 0)) "
+        "WHERE account_id = ? AND lead_id = ? AND integration_id = ?), 1)) "
         "ON CONFLICT DO NOTHING",
         (*values, key.account_id, key.lead_id, key.integration_id),
     )
@@ -316,16 +318,21 @@ def store_event(
     )
     save_outgoing_receipt(connection, message_id, event)
     save_message_preview(connection, message_id, event)
-    if not imported and event.direction == "incoming":
-        member_ids = conversation_chat_ids(connection, chat_id)
-        placeholders = ",".join("?" for _ in member_ids)
-        connection.execute(
-            f"UPDATE drafts SET status = 'stale' WHERE chat_id IN ({placeholders}) "
-            "AND status IN ('pending', 'approved')",
-            member_ids,
+    if not imported:
+        own_receipt = (
+            event.direction == "outgoing"
+            and connection.execute(
+                "SELECT 1 FROM outgoing_attempts WHERE request_id = ? AND chat_id = ? AND text = ?",
+                (event.custom_id, chat_id, event.text),
+            ).fetchone()
         )
-        if event.text.strip():
+        if not own_receipt:
+            invalidate_conversation(connection, chat_id)
+        if event.direction == "incoming" and event.text.strip():
             connection.execute("INSERT INTO jobs(message_id) VALUES (?)", (message_id,))
+        elif event.direction == "outgoing" and not own_receipt:
+            for member_id in conversation_chat_ids(connection, chat_id):
+                connection.execute("UPDATE chats SET paused = 1 WHERE id = ?", (member_id,))
     return True
 
 
@@ -358,16 +365,7 @@ def reconcile_outgoing_attempt(connection: sqlite3.Connection, request_id: str) 
         (request_id,),
     ).fetchone()
     if confirmed:
-        connection.execute(
-            "UPDATE drafts SET status = 'sent' WHERE 'draft:' || id = ? "
-            "AND status IN ('unknown', 'failed')",
-            (request_id,),
-        )
-        connection.execute(
-            "UPDATE drafts SET status = 'sent' WHERE status IN ('pending', 'approved', 'unknown') "
-            "AND message_id IN (SELECT message_id FROM jobs WHERE 'consultation:' || id = ?)",
-            (request_id,),
-        )
+        clear_answered_suggestion(connection, request_id)
         connection.execute(
             "UPDATE jobs SET status = 'done' WHERE 'consultation:' || id = ? "
             "AND status IN ('processing', 'unknown')",
@@ -404,21 +402,19 @@ def save_outgoing_receipt(
 
 
 def claim_next_job(connection: sqlite3.Connection) -> sqlite3.Row | None:
-    """Caller holds BEGIN IMMEDIATE; one active job per unpaused conversation, FIFO."""
+    """Caller holds BEGIN IMMEDIATE; one active job per conversation, FIFO."""
     row = connection.execute(
-        "SELECT j.id, j.message_id, m.chat_id FROM jobs j "
+        "SELECT j.id, j.message_id, j.generation, m.chat_id FROM jobs j "
         "JOIN messages m ON m.id = j.message_id JOIN chats c ON c.id = m.chat_id "
-        "WHERE j.status = 'pending' AND c.paused = 0 "
+        "WHERE j.status = 'pending' "
         "AND NOT EXISTS (SELECT 1 FROM jobs active JOIN messages am "
         "ON am.id = active.message_id JOIN chats ac ON ac.id = am.chat_id "
         "WHERE ac.account_id = c.account_id AND ac.lead_id = c.lead_id "
         "AND ac.integration_id = c.integration_id "
-        "AND active.status IN ('processing', 'unknown')) "
+        "AND (active.status = 'processing' OR (active.status = 'unknown' AND c.paused = 0))) "
         "AND NOT EXISTS (SELECT 1 FROM outgoing_attempts o JOIN chats oc ON oc.id = o.chat_id "
         "WHERE oc.account_id = c.account_id AND oc.lead_id = c.lead_id "
-        "AND oc.integration_id = c.integration_id AND o.status = 'unknown') "
-        "AND NOT EXISTS (SELECT 1 FROM chats pc WHERE pc.account_id = c.account_id "
-        "AND pc.lead_id = c.lead_id AND pc.integration_id = c.integration_id AND pc.paused = 1) "
+        "AND oc.integration_id = c.integration_id AND o.status = 'unknown' AND c.paused = 0) "
         "ORDER BY j.id LIMIT 1"
     ).fetchone()
     if row is not None:
@@ -463,19 +459,21 @@ def get_conversation_lead(connection: sqlite3.Connection, chat_id: int) -> Lead:
     )
 
 
-def consultation_is_current(connection: sqlite3.Connection, job_id: int) -> bool:
+def consultation_is_current(connection: sqlite3.Connection, job_id: int, generation: int) -> bool:
     return (
         connection.execute(
             "SELECT 1 FROM jobs j JOIN messages m ON m.id = j.message_id "
             "JOIN chats c ON c.id = m.chat_id WHERE j.id = ? AND j.status = 'processing' "
-            "AND c.paused = 0 AND NOT EXISTS (SELECT 1 FROM chats pc "
-            "WHERE pc.account_id = c.account_id AND pc.lead_id = c.lead_id "
-            "AND pc.integration_id = c.integration_id AND pc.paused = 1) "
+            "AND j.generation = ? "
             "AND NOT EXISTS (SELECT 1 FROM messages newer JOIN chats nc ON nc.id = newer.chat_id "
             "WHERE nc.account_id = c.account_id AND nc.lead_id = c.lead_id "
-            "AND nc.integration_id = c.integration_id AND newer.direction = 'incoming' "
-            "AND newer.imported = 0 AND newer.id > m.id)",
-            (job_id,),
+            "AND nc.integration_id = c.integration_id "
+            "AND newer.imported = 0 AND newer.id > m.id "
+            "AND (newer.direction = 'incoming' OR NOT EXISTS ("
+            "SELECT 1 FROM outgoing_receipts r JOIN outgoing_attempts a "
+            "ON a.request_id = r.custom_id WHERE r.message_id = newer.id "
+            "AND a.chat_id = newer.chat_id AND a.text = newer.text)))",
+            (job_id, generation),
         ).fetchone()
         is not None
     )
@@ -524,89 +522,129 @@ def load_consultation_context(
 
 
 def save_consultation(
-    connection: sqlite3.Connection,
-    job: sqlite3.Row,
-    lead: Lead,
-    reply: str,
-) -> int | None:
-    """Caller holds BEGIN IMMEDIATE. A stale generation cannot update a newer draft/lead."""
-    if not consultation_is_current(connection, job["id"]):
-        finish_consultation_job(connection, job["id"], "done")
+    connection: sqlite3.Connection, job: sqlite3.Row, lead: Lead, reply: str
+) -> bool | None:
+    """Return paused state, or None for stale work. Caller holds BEGIN IMMEDIATE."""
+    if not consultation_is_current(connection, job["id"], job["generation"]):
+        finish_consultation_job(connection, job["id"], "done", job["generation"])
         return None
     save_lead(connection, job["chat_id"], lead)
-    connection.execute(
-        "UPDATE drafts SET status = 'stale' WHERE chat_id = ? AND status IN ('pending', 'approved')",
-        (job["chat_id"],),
+    member_ids = conversation_chat_ids(connection, job["chat_id"])
+    placeholders = ",".join("?" for _ in member_ids)
+    paused = bool(
+        connection.execute(
+            f"SELECT MAX(paused) FROM chats WHERE id IN ({placeholders})", member_ids
+        ).fetchone()[0]
     )
-    cursor = connection.execute(
-        "INSERT INTO drafts(chat_id, message_id, text) VALUES (?, ?, ?)",
-        (job["chat_id"], job["message_id"], reply),
-    )
-    return cursor.lastrowid
+    if paused:
+        connection.execute(
+            "INSERT INTO suggestions(conversation_id, message_id, text) VALUES (?, ?, ?) "
+            "ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, "
+            "text = excluded.text, created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            (member_ids[0], job["message_id"], reply),
+        )
+    return paused
 
 
 def finish_consultation_job(
-    connection: sqlite3.Connection,
-    job_id: int,
-    status: str,
-    *,
-    draft_id: int | None = None,
-    draft_status: str | None = None,
+    connection: sqlite3.Connection, job_id: int, status: str, generation: int
 ) -> None:
-    connection.execute("UPDATE jobs SET status = ? WHERE id = ?", (status, job_id))
-    if draft_id is not None and draft_status is not None:
-        connection.execute(
-            "UPDATE drafts SET status = ? WHERE id = ? AND status != 'stale'",
-            (draft_status, draft_id),
-        )
+    connection.execute(
+        "UPDATE jobs SET status = ? WHERE id = ? AND generation = ? AND status = 'processing'",
+        (status, job_id, generation),
+    )
 
 
 def recover_interrupted_jobs(connection: sqlite3.Connection) -> int:
     """Single-backend startup: retry generation only if no send was reserved."""
     rows = connection.execute(
-        "SELECT j.id, j.message_id, a.status FROM jobs j LEFT JOIN outgoing_attempts a "
-        "ON a.request_id = 'consultation:' || j.id WHERE j.status = 'processing'",
+        "SELECT j.id, j.generation, a.status FROM jobs j LEFT JOIN outgoing_attempts a "
+        "ON a.request_id = 'consultation:' || j.id AND j.generation = 0 "
+        "WHERE j.status = 'processing'",
     ).fetchall()
     for row in rows:
         status = row["status"]
         job_status = "pending" if status is None else "unknown" if status == "unknown" else "done"
-        finish_consultation_job(connection, row["id"], job_status)
-        if status is not None:
-            connection.execute(
-                "UPDATE drafts SET status = ? WHERE message_id = ? AND status != 'stale'",
-                (status if status in {"sent", "unknown"} else "failed", row["message_id"]),
-            )
+        finish_consultation_job(connection, row["id"], job_status, row["generation"])
     return len(rows)
 
 
-def interrupt_consultation(
-    connection: sqlite3.Connection,
-    job_id: int,
-    draft_id: int | None,
-) -> None:
+def interrupt_consultation(connection: sqlite3.Connection, job_id: int, generation: int) -> None:
     attempt = connection.execute(
         "SELECT status FROM outgoing_attempts WHERE request_id = ?",
         (f"consultation:{job_id}",),
     ).fetchone()
     status = attempt["status"] if attempt else "failed"
     finish_consultation_job(
-        connection,
-        job_id,
-        "done" if status in {"sent", "blocked"} else status,
-        draft_id=draft_id,
-        draft_status=status if status in {"sent", "unknown"} else "failed",
+        connection, job_id, "done" if status in {"sent", "blocked"} else status, generation
     )
 
 
 def cancel_generation(connection: sqlite3.Connection, chat_id: int) -> None:
-    """Invalidate an in-flight generation even if the chat is immediately resumed.
-
-    A reserved send cannot be recalled. Pending jobs remain queued for resume.
-    """
+    """Invalidate queued and in-flight work. A reserved send cannot be recalled."""
     connection.execute(
-        "UPDATE jobs SET status = 'done' WHERE status = 'processing' "
+        "UPDATE jobs SET status = 'done', generation = generation + 1 "
+        "WHERE status IN ('pending', 'processing') "
         "AND message_id IN (SELECT id FROM messages WHERE chat_id = ?) "
         "AND NOT EXISTS (SELECT 1 FROM outgoing_attempts a "
-        "WHERE a.request_id = 'consultation:' || jobs.id)",
+        "WHERE a.request_id = 'consultation:' || jobs.id AND a.status IN ('sent', 'unknown'))",
         (chat_id,),
     )
+
+
+def invalidate_conversation(connection: sqlite3.Connection, chat_id: int) -> None:
+    member_ids = conversation_chat_ids(connection, chat_id)
+    for member_id in member_ids:
+        cancel_generation(connection, member_id)
+    connection.execute("DELETE FROM suggestions WHERE conversation_id = ?", (member_ids[0],))
+
+
+def queue_unanswered_message(connection: sqlite3.Connection, chat_id: int) -> None:
+    """Called only on a transition to pause, after invalidating the old generation."""
+    member_ids = conversation_chat_ids(connection, chat_id)
+    placeholders = ",".join("?" for _ in member_ids)
+    latest = connection.execute(
+        f"SELECT * FROM messages WHERE chat_id IN ({placeholders}) AND imported = 0 "
+        "AND direction = 'incoming' "
+        "ORDER BY id DESC LIMIT 1",
+        member_ids,
+    ).fetchone()
+    if latest is None or not latest["text"].strip():
+        return
+    if connection.execute(
+        f"SELECT 1 FROM messages m WHERE chat_id IN ({placeholders}) AND imported = 0 "
+        "AND direction = 'outgoing' AND id > ? AND NOT EXISTS ("
+        "SELECT 1 FROM outgoing_receipts r JOIN outgoing_attempts a "
+        "ON a.request_id = r.custom_id WHERE r.message_id = m.id "
+        "AND a.chat_id = m.chat_id AND a.text = m.text)",
+        (*member_ids, latest["id"]),
+    ).fetchone():
+        return
+    answered = connection.execute(
+        f"SELECT 1 FROM outgoing_attempts WHERE chat_id IN ({placeholders}) "
+        "AND status IN ('sent', 'unknown') AND (message_id >= ? OR "
+        "(message_id IS NULL AND julianday(created_at) >= julianday(?)))",
+        (*member_ids, latest["id"], latest["created_at"]),
+    ).fetchone()
+    if answered:
+        return
+    connection.execute(
+        "INSERT INTO jobs(message_id) VALUES (?) ON CONFLICT(message_id) DO UPDATE SET "
+        "status = 'pending', generation = jobs.generation + 1 "
+        "WHERE NOT EXISTS (SELECT 1 FROM outgoing_attempts a "
+        "WHERE a.request_id = 'consultation:' || jobs.id AND a.status IN ('sent', 'unknown'))",
+        (latest["id"],),
+    )
+
+
+def clear_answered_suggestion(connection: sqlite3.Connection, request_id: str) -> None:
+    attempt = connection.execute(
+        "SELECT chat_id, message_id FROM outgoing_attempts WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    if attempt:
+        root = conversation_chat_ids(connection, attempt["chat_id"])[0]
+        connection.execute(
+            "DELETE FROM suggestions WHERE conversation_id = ? AND message_id <= ?",
+            (root, attempt["message_id"]),
+        )

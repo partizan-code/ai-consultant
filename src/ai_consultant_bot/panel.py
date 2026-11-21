@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from collections.abc import Callable
+from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
 from urllib.parse import quote
@@ -24,9 +25,6 @@ LEAD_LABELS = {
     "purchase_time": "Срок покупки",
 }
 STATUS_LABELS = {
-    "pending": "Ожидает одобрения",
-    "approved": "Одобрен",
-    "stale": "Устарел",
     "sent": "Принят Umnico",
     "failed": "Ошибка",
     "unknown": "Результат неизвестен — повтор заблокирован",
@@ -66,11 +64,139 @@ PANEL_STYLES = """
     }
     .st-key-chat_tabs button { text-align: left; justify-content: flex-start; }
     .st-key-chat_tabs [data-testid="stVerticalBlock"] { gap: 0.4rem; }
+    /* Streamlit inserts layout wrappers between keyed containers and columns. */
+    .st-key-chat_layout [data-testid="stColumn"] {
+        box-sizing: border-box;
+        padding-inline: 1rem;
+    }
+    .st-key-chat_layout [data-testid="stColumn"]:has(.st-key-chat_tabs) {
+        padding-left: 0;
+    }
+    .st-key-chat_layout [data-testid="stColumn"]:has(.st-key-client_card) {
+        padding-right: 0;
+    }
+    @media (min-width: 641px) {
+        /* Reserve the viewport once, including the toolbar clearance and bottom padding. */
+        .block-container:has(.st-key-chat_layout) {
+            box-sizing: border-box;
+            height: 100dvh;
+            min-height: 0;
+            padding-bottom: 0.75rem;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        /* Carry the available height through Streamlit's layout and fragment wrappers. */
+        .block-container :is(
+            [data-testid="stLayoutWrapper"], [data-testid="stVerticalBlock"]
+        ):has(.st-key-chat_layout),
+        .st-key-chat_layout,
+        .st-key-chat_layout :is(
+            [data-testid="stLayoutWrapper"], [data-testid="stVerticalBlock"],
+            [data-testid="stHorizontalBlock"]
+        ):has(.st-key-conversation_window),
+        .st-key-conversation_window,
+        .st-key-conversation_window :is(
+            [data-testid="stLayoutWrapper"], [data-testid="stVerticalBlock"]
+        ):has(.st-key-chat_thread) {
+            flex: 1 1 0;
+            min-height: 0;
+            height: 100%;
+        }
+        .st-key-chat_layout [data-testid="stColumn"] {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            min-height: 0;
+            overflow: hidden;
+        }
+        .st-key-chat_layout [data-testid="stColumn"] {
+            min-width: 0;
+        }
+        .st-key-chat_layout [data-testid="stColumn"]:has(.st-key-conversation_window) {
+            border-inline: 1px solid var(--st-border-color, rgba(128, 128, 128, 0.25));
+        }
+        .st-key-chat_thread {
+            height: 100%;
+            min-height: 0;
+            flex: 1 1 0;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+        .st-key-conversation_window [data-testid="stLayoutWrapper"]:has(
+            > .st-key-reply_composer
+        ),
+        .st-key-reply_composer {
+            flex: 0 0 auto;
+            height: auto;
+        }
+        .st-key-reply_composer textarea {
+            resize: none;
+        }
+        .st-key-suggestion_preview {
+            max-height: min(18dvh, 8rem);
+            overflow-y: auto;
+        }
+        .st-key-chat_layout [data-testid="stColumn"] > [data-testid="stVerticalBlock"],
+        .st-key-chat_layout :is(
+            [data-testid="stLayoutWrapper"], [data-testid="stVerticalBlock"]
+        ):has(.st-key-client_card),
+        .st-key-chat_layout :is(
+            [data-testid="stLayoutWrapper"], [data-testid="stVerticalBlock"]
+        ):has(.st-key-chat_list_scroll) {
+            flex: 1 1 0;
+            height: 100%;
+            min-height: 0;
+        }
+        .st-key-chat_list_scroll {
+            flex: 1 1 0;
+            height: 100%;
+            min-height: 0;
+            overflow-y: auto;
+        }
+        .st-key-client_card {
+            height: 100%;
+            min-height: 0;
+            overflow-y: auto;
+        }
+    }
+    .st-key-chat_thread {
+        border-top: 1px solid var(--st-border-color, rgba(128, 128, 128, 0.25));
+        border-bottom: 1px solid var(--st-border-color, rgba(128, 128, 128, 0.25));
+        border-radius: 0;
+        box-sizing: border-box;
+        width: 100%;
+        max-width: 100%;
+    }
+    .st-key-suggestion_preview [data-testid="stText"] {
+        font-size: 0.875rem;
+        line-height: 1.45;
+    }
+    .st-key-suggestion_preview [data-testid="stText"] > span {
+        color: #52bf7c;
+    }
     .st-key-chat_thread [data-testid="stVerticalBlock"] { gap: 0.25rem; }
     .st-key-chat_thread [data-testid="stChatMessage"] {
         padding: 0.45rem 0.65rem;
         gap: 0.5rem;
         border-radius: 0.65rem;
+    }
+    .st-key-chat_thread [data-testid="stChatMessage"]:has(
+        [data-testid="stChatMessageAvatarAssistant"]
+    ) {
+        width: fit-content;
+        max-width: min(70%, 38rem);
+        margin-left: auto;
+        flex-direction: row-reverse;
+    }
+    .st-key-chat_thread [data-testid="stChatMessageContent"] {
+        margin: 0;
+        flex-grow: 0;
+    }
+    .st-key-chat_thread [data-testid="stChatMessage"]:has(
+        [data-testid="stChatMessageAvatarAssistant"]
+    ) [data-testid="stCaptionContainer"] {
+        text-align: right;
     }
     .st-key-chat_thread [data-testid="stText"] {
         font-size: 0.9rem;
@@ -112,29 +238,53 @@ def page_offset(label: str, total: int, settings: Settings, key: str) -> int:
 
 def show_result(result: dict) -> None:
     status = result["status"]
+    if status == "sent":
+        return
     message = STATUS_LABELS.get(status, status)
     if result.get("error_code"):
         message += f" ({result['error_code']})"
-    if status == "sent":
-        st.success(message + ". Доставка подтверждается исходящим webhook.")
-    else:
-        st.warning(message)
+    st.warning(message)
+
+
+def run_history_refresh(function: Callable[..., None], settings: Settings, *args: object) -> None:
+    def refresh() -> None:
+        function(settings, *args)
+
+    # Streamlit retains a timer for the same function and call site across app reruns.
+    # A new identity after sending starts a fresh interval for the history.
+    revision = st.session_state.get("chat_refresh_revision", 0)
+    refresh.__qualname__ = f"{function.__qualname__}_refresh_{revision}"
+    st.fragment(run_every=settings.panel_history_refresh_interval)(refresh)()
+
+
+def refresh_after_send() -> None:
+    st.session_state["chat_refresh_revision"] = st.session_state.get("chat_refresh_revision", 0) + 1
+    st.rerun()
 
 
 def show_chat(settings: Settings, chat_id: int, client_card: DeltaGenerator) -> None:
-    # A full page rerun opens at the latest message; timer reruns keep the current view.
+    # A full rerun opens at the latest message; timer updates follow only at the bottom.
     st.session_state["chat_scroll_revision"] = st.session_state.get("chat_scroll_revision", 0) + 1
-    # The timer never redraws the form: its unsubmitted text stays in the browser.
-    st.fragment(run_every=settings.panel_refresh_interval)(show_chat_updates)(
-        settings, chat_id, client_card
-    )
-    show_manual_reply(settings, chat_id)
+    # The timer redraws data and buttons only; the editor keeps its widget state.
+    with st.container(border=False, key="conversation_window"):
+        st.fragment(run_every=settings.panel_refresh_interval)(show_chat_updates)(
+            settings, chat_id, client_card
+        )
+        run_history_refresh(show_history_updates, settings, chat_id)
+        show_manual_reply(settings, chat_id)
 
 
 def show_chat_updates(settings: Settings, chat_id: int, client_card: DeltaGenerator) -> None:
     # Catch inside the fragment too: timer reruns do not enter render_panel's try block.
     try:
         show_chat_data(settings, chat_id, client_card)
+    except PanelError as error:
+        st.error(str(error))
+
+
+def show_history_updates(settings: Settings, chat_id: int) -> None:
+    try:
+        show_messages(settings, chat_id, admin_request(settings, "GET", f"chats/{chat_id}"))
     except PanelError as error:
         st.error(str(error))
 
@@ -192,30 +342,40 @@ def show_chat_data(settings: Settings, chat_id: int, client_card: DeltaGenerator
             st.warning("Найдено несколько каналов Direct; маршрут ответа требует уточнения.")
         else:
             st.warning("Личный ответ после комментария пока недоступен: " + blocked)
-    show_messages(settings, chat_id, detail)
-    show_drafts(settings, chat_id, detail)
-    show_attempts(detail)
 
 
 def show_messages(settings: Settings, chat_id: int, detail: dict) -> None:
-    offset = page_offset(
-        "Страница переписки (1 — новые)", detail["message_total"], settings, f"messages_{chat_id}"
-    )
-    if offset:
-        detail = admin_request(settings, "GET", f"chats/{chat_id}?offset={offset}")
-    # Photo loading and fragment refreshes must not pull against manual scrolling.
-    with st.container(height=420, border=True, key="chat_thread", autoscroll=False):
-        if not detail["messages"]:
+    messages = detail["messages"]
+    pending = [
+        {
+            "direction": "outgoing",
+            "text": attempt["text"],
+            "occurred_at": attempt["created_at"],
+            "imported": False,
+        }
+        for attempt in detail.get("attempts", [])
+        if attempt["status"] == "sent" and not attempt["confirmed"]
+    ]
+    if pending:
+
+        def message_time(message: dict) -> datetime:
+            timestamp = datetime.fromisoformat(message["occurred_at"])
+            return timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=UTC)
+
+        messages = sorted([*messages, *pending], key=message_time)
+    # The script follows updates at the bottom without interrupting history reading.
+    with st.container(height=420, border=False, key="chat_thread", autoscroll=False):
+        if not messages:
             st.info("В этом чате пока нет сообщений.")
-        for message in detail["messages"]:
+        for message in messages:
             role = "user" if message["direction"] == "incoming" else "assistant"
             with st.chat_message(role):
                 st.text(message["text"] or "[Сообщение без текста]")
-                if message["post_url"]:
+                if message.get("post_url"):
                     st.text("Пост: " + message["post_url"])
-                if message["post_description"]:
+                if message.get("post_description"):
                     st.text(message["post_description"])
-                if message["post_owner"]:
+                if message.get("post_owner"):
                     st.text("Автор поста: " + message["post_owner"])
                 if message.get("post_photo_url"):
                     st.image(message["post_photo_url"], width=260)
@@ -226,63 +386,80 @@ def show_messages(settings: Settings, chat_id: int, detail: dict) -> None:
     with st.container(key="chat_scroll_init"):
         # Only integer view IDs enter this script; message content stays in st.text.
         revision = st.session_state.get("chat_scroll_revision", 0)
-        script = CHAT_SCROLL_SCRIPT.replace("__CHAT_VIEW__", f"{chat_id}:{offset}:{revision}")
+        script = CHAT_SCROLL_SCRIPT.replace("__CHAT_VIEW__", f"{chat_id}:0:{revision}")
         st.html(f"<script>{script}</script>", unsafe_allow_javascript=True)
-    if st.button("Импортировать историю", key=f"history_{chat_id}"):
-        route_id = detail.get("reply_chat_id") or chat_id
-        result = admin_request(settings, "POST", f"chats/{route_id}/import-history")
-        st.success(f"Добавлено сообщений: {result['imported']}. Переписка обновится автоматически.")
 
 
-def show_drafts(settings: Settings, chat_id: int, detail: dict) -> None:
-    st.subheader("Черновики")
-    for draft in detail["drafts"]:
-        with st.expander(
-            f"#{draft['id']} · {STATUS_LABELS.get(draft['status'], draft['status'])}",
-            expanded=draft["status"] == "pending",
-        ):
-            st.text(draft["text"])
-            comment = draft.get("source_type") == "comment"
-            if comment and not detail["reply_block_reason"]:
-                st.caption(
-                    "Личный ответ на комментарий пока недоступен; можно ответить в Direct вручную."
-                )
-            if draft["status"] == "pending" and st.button(
-                "Одобрить и отправить",
-                key=f"approve_{draft['id']}",
-                disabled=bool(detail["chat"]["paused"])
-                or comment
-                or bool(detail["reply_block_reason"]),
-            ):
-                st.session_state["send_result"] = admin_request(
-                    settings,
-                    "POST",
-                    f"chats/{draft.get('chat_id', chat_id)}/drafts/{draft['id']}/approve",
-                )
-                st.rerun()
+def use_suggestion(chat_id: int, revision: int, text: str) -> None:
+    st.session_state[f"manual_revision_{chat_id}"] = revision + 1
+    st.session_state[f"manual_text_{chat_id}_{revision + 1}"] = text
+    st.session_state.pop(f"suggestion_replace_{chat_id}", None)
+    st.rerun()
+
+
+def show_suggestion(settings: Settings, chat_id: int) -> None:
+    try:
+        detail = admin_request(settings, "GET", f"chats/{chat_id}")
+    except PanelError as error:
+        st.error(str(error))
+        return
+    suggestion = detail["suggestion"] if detail["chat"]["paused"] else None
+    if suggestion:
+        with st.container(key="suggestion_preview", gap="xxsmall"):
+            st.caption("Подсказка ИИ")
+            st.text(suggestion["text"])
+
+
+def confirm_suggestion(
+    chat_id: int, revision: int, suggestion: dict | None, selected: bool
+) -> None:
+    confirm_key = f"suggestion_replace_{chat_id}"
+    if not suggestion:
+        st.session_state.pop(confirm_key, None)
+        return
+    if selected:
+        if st.session_state.get(f"manual_text_{chat_id}_{revision}", ""):
+            st.session_state[confirm_key] = suggestion["text"]
+        else:
+            use_suggestion(chat_id, revision, suggestion["text"])
+    if confirm_key in st.session_state:
+        st.warning("Заменить набранный текст подсказкой?")
+        if st.session_state[confirm_key] != suggestion["text"]:
+            st.text(st.session_state[confirm_key])
+        if st.button("Подтвердить замену"):
+            use_suggestion(chat_id, revision, st.session_state[confirm_key])
+        if st.button("Отмена"):
+            del st.session_state[confirm_key]
+            st.rerun()
 
 
 def show_manual_reply(settings: Settings, chat_id: int) -> None:
-    st.subheader("Ручной ответ")
-    st.caption("Отправка поставит бота на паузу и отменит прежние черновики.")
     revision_key = f"manual_revision_{chat_id}"
     pending_key = f"manual_attempt_{chat_id}"
     pending = st.session_state.get(pending_key)
     attempts = st.session_state.get(f"chat_attempts_{chat_id}", [])
     # A full rerun can clear a recovered send before creating the input widget.
     if pending and any(
-        a["request_id"] == pending["request_id"] and a["status"] != "unknown" for a in attempts
+        a["request_id"] == pending["request_id"] and a["status"] == "sent" for a in attempts
     ):
         del st.session_state[pending_key]
-        st.session_state[revision_key] = st.session_state.get(revision_key, 0) + 1
+        revision = st.session_state.get(revision_key, 0)
+        if st.session_state.get(f"manual_text_{chat_id}_{revision}", "") == pending["text"]:
+            st.session_state[revision_key] = revision + 1
     revision = st.session_state.get(revision_key, 0)
-    with st.form(f"manual_{chat_id}_{revision}"):
+    with st.container(key="reply_composer"):
+        st.fragment(run_every=settings.panel_refresh_interval)(show_suggestion)(settings, chat_id)
         st.text_area(
             "Текст ответа",
+            label_visibility="collapsed",
             max_chars=settings.consultation_reply_max_chars,
             key=f"manual_text_{chat_id}_{revision}",
+            placeholder=(
+                "Введите сообщение... Отправка поставит бота на паузу.\n"
+                "Подсказки появляются после нового сообщения клиента"
+            ),
         )
-        # Refresh only the controls within the form, leaving browser draft text untouched.
+        # Refresh controls independently so typing is never overwritten by the timer.
         st.fragment(run_every=settings.panel_refresh_interval)(show_manual_updates)(
             settings, chat_id, revision
         )
@@ -293,12 +470,26 @@ def show_manual_updates(settings: Settings, chat_id: int, revision: int) -> None
         detail = admin_request(settings, "GET", f"chats/{chat_id}")
     except PanelError as error:
         st.error(str(error))
-        st.form_submit_button("Отправить ответ", disabled=True)
+        st.button("Отправить ответ", disabled=True)
         return
     uncertain = any(a["status"] == "unknown" for a in detail["attempts"])
-    submit = st.form_submit_button(
-        "Отправить ответ", disabled=bool(detail["reply_block_reason"]) or uncertain
-    )
+    suggestion = detail["suggestion"] if detail["chat"]["paused"] else None
+    with st.container(horizontal=True, vertical_alignment="center", key=f"reply_actions_{chat_id}"):
+        history = st.button("Импортировать историю", key=f"history_{chat_id}")
+        selected = st.button("Использовать подсказку") if suggestion else False
+        submit = st.button(
+            "Отправить ответ", disabled=bool(detail["reply_block_reason"]) or uncertain
+        )
+    if history:
+        route_id = detail.get("reply_chat_id") or chat_id
+        try:
+            result = admin_request(settings, "POST", f"chats/{route_id}/import-history")
+            st.success(
+                f"Добавлено сообщений: {result['imported']}. Переписка обновится автоматически."
+            )
+        except PanelError as error:
+            st.error(str(error))
+    confirm_suggestion(chat_id, revision, suggestion, selected)
     revision_key = f"manual_revision_{chat_id}"
     pending_key = f"manual_attempt_{chat_id}"
     pending = st.session_state.get(pending_key)
@@ -308,15 +499,20 @@ def show_manual_updates(settings: Settings, chat_id: int, revision: int) -> None
     )
     if saved:
         show_result(saved)
+        if saved["status"] == "sent" and not submit:
+            del st.session_state[pending_key]
+            if st.session_state.get(f"manual_text_{chat_id}_{revision}", "") == pending["text"]:
+                st.session_state[revision_key] = revision + 1
+            st.session_state["send_result"] = saved
+            refresh_after_send()
     if submit:
         text = st.session_state.get(f"manual_text_{chat_id}_{revision}", "")
-        # A timed refresh may discover success after a lost HTTP response. Keep the
-        # browser text, but never turn that same text into a second outgoing request.
+        # Never turn a recovered successful send into a second outgoing request.
         if saved and saved["status"] != "unknown":
             del st.session_state[pending_key]
-            if pending["text"] == text:
+            if saved["status"] == "sent" and pending["text"] == text:
                 st.session_state[revision_key] = revision + 1
-                st.rerun()
+                refresh_after_send()
             pending = None
         if not text.strip():
             st.warning("Введите текст ответа.")
@@ -335,25 +531,16 @@ def show_manual_updates(settings: Settings, chat_id: int, revision: int) -> None
                 st.session_state["send_result"] = result
                 if result["status"] != "unknown":
                     del st.session_state[pending_key]
-                    st.session_state[revision_key] = revision + 1
+                    if result["status"] == "sent":
+                        st.session_state[revision_key] = revision + 1
+                        refresh_after_send()
                 st.rerun()
-
-
-def show_attempts(detail: dict) -> None:
-    if detail["attempts"]:
-        with st.expander("Последние попытки отправки"):
-            for attempt in detail["attempts"]:
-                st.caption(attempt["created_at"] + " · " + STATUS_LABELS[attempt["status"]])
-                st.text(attempt["text"])
-                if attempt["confirmed"]:
-                    st.caption("Подтверждено исходящим сообщением")
-                if attempt["error_code"]:
-                    st.text(attempt["error_code"])
 
 
 def show_chats(settings: Settings) -> None:
     # The old left column used 1/4 of the width; 3/16 is 25% narrower.
-    chat_list, conversation, client = st.columns([3, 10, 3], gap="medium")
+    with st.container(key="chat_layout"):
+        chat_list, conversation, client = st.columns([3, 10, 3], gap=None)
     client_card = client.empty()
     chat_tabs = chat_list.container(key="chat_tabs")
     with chat_tabs:
@@ -387,7 +574,7 @@ def show_chat_list(settings: Settings) -> None:
         ):
             st.session_state["selected_chat_id"] = next(iter(chats))
             st.rerun()
-        with st.container(height=560, border=False):
+        with st.container(height=560, border=False, key="chat_list_scroll"):
             for chat_id, chat in chats.items():
                 name = chat_title(chat)
                 if st.button(
@@ -400,8 +587,6 @@ def show_chat_list(settings: Settings) -> None:
                 ):
                     st.session_state["selected_chat_id"] = chat_id
                     st.rerun()
-                sources = chat.get("source_types", chat["source_type"]).replace(",", " · ")
-                st.caption(f"{sources} · черновиков: {chat['pending_drafts']}")
     except PanelError as error:
         st.error(str(error))
 
@@ -438,15 +623,9 @@ def show_settings(settings: Settings) -> None:
             max_chars=settings.model_max_chars,
             key="settings_model",
         )
-        auto_reply = st.toggle(
-            "Автоответы в Direct", value=data["auto_reply"], key="settings_auto_reply"
-        )
-        st.caption(
-            "При выключенных автоответах черновики требуют одобрения. "
-            "Модель применяется к следующим заданиям; старые черновики не отправляются автоматически."
-        )
+        st.caption("Модель применяется к следующим заданиям. Активность задаётся в переписке.")
         if st.form_submit_button("Сохранить настройки"):
-            admin_request(settings, "PUT", "settings", {"model": model, "auto_reply": auto_reply})
+            admin_request(settings, "PUT", "settings", {"model": model})
             st.success("Настройки сохранены.")
     if st.button("Обновить базу знаний"):
         result = admin_request(settings, "POST", "knowledge/reload")
@@ -464,8 +643,7 @@ def show_settings_updates(settings: Settings) -> None:
     if first_load:
         st.rerun()
     # Keep saved values current without overwriting unsaved editor input.
-    mode = "включены" if data["auto_reply"] else "выключены"
-    st.caption(f"Сохранено: модель {data['model']}; автоответы {mode}.")
+    st.caption(f"Сохранено: модель {data['model']}.")
 
 
 def show_status_updates(settings: Settings) -> None:

@@ -25,11 +25,9 @@ def test_settings_survive_reinitialization_and_reopening(tmp_path: Path) -> None
         initialize_database(connection, Settings())
         with connection:
             set_setting(connection, "model", "chosen/model")
-            set_setting(connection, "auto_reply", "1")
     with open_database(path, timeout=1) as connection:
         initialize_database(connection, Settings(default_model="other/model"))
         assert get_setting(connection, "model") == "chosen/model"
-        assert get_setting(connection, "auto_reply") == "1"
         with pytest.raises(ValueError):
             set_setting(connection, "admin_token", "must-not-be-stored")
 

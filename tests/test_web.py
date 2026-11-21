@@ -294,7 +294,8 @@ def test_worker_lifecycle_and_authenticated_knowledge_reload(tmp_path: Path) -> 
                 with open_database(settings.database_path, timeout=1) as connection:
                     assert connection.execute("SELECT status FROM jobs").fetchone()[0] == "done"
                     assert (
-                        connection.execute("SELECT status FROM drafts").fetchone()[0] == "pending"
+                        connection.execute("SELECT text FROM suggestions").fetchone()[0]
+                        == "Обивка велюр."
                     )
         assert app.state.openrouter._http.is_closed and app.state.umnico._http.is_closed
 
