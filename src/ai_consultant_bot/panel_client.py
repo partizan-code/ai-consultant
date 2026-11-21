@@ -48,9 +48,23 @@ def admin_request(
             400: "Проверьте введённые значения.",
             401: "ADMIN_TOKEN панели и backend не совпадает.",
             404: "Запись не найдена. Дождитесь автоматического обновления данных.",
-            409: "Действие заблокировано. После автообновления проверьте паузу и состояние отправки.",
+            409: "Действие не выполнено. Проверьте состояние операции в разделе «Состояние».",
             503: "Backend не готов: проверьте ADMIN_TOKEN и доступность SQLite.",
         }
+        if response.status_code == 409:
+            if path.endswith("/import-history"):
+                messages[409] = (
+                    "Не удалось импортировать историю. Проверьте код ошибки в разделе «Состояние»."
+                )
+            try:
+                error = response.json()
+            except ValueError:
+                error = None
+            if isinstance(error, dict) and error.get("error_code") == "invalid_history_response":
+                messages[409] = (
+                    "Не удалось импортировать историю: Umnico вернул неожиданный формат ответа. "
+                    "Диагностика типов полей записана в лог backend."
+                )
         raise PanelError(messages.get(response.status_code, "Запрос backend не выполнен."))
     try:
         result = response.json()

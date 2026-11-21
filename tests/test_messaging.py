@@ -267,7 +267,10 @@ def test_incoming_marks_drafts_stale_and_jobs_are_serialized(settings: Settings)
         assert claim_next_job(connection)["message_id"] == 2
 
 
-def test_paginated_history_never_queues_replies_even_on_later_webhook(settings: Settings) -> None:
+@pytest.mark.parametrize("end_source,end_cursor", [(0, 0), (0, None), (255, None)])
+def test_paginated_history_never_queues_replies_even_on_later_webhook(
+    settings: Settings, end_source: int, end_cursor: int | None
+) -> None:
     ingest_event(settings, incoming())
     calls = []
 
@@ -280,8 +283,8 @@ def test_paginated_history_never_queues_replies_even_on_later_webhook(settings: 
             200,
             json={
                 "messages": [message] if page < 2 else [],
-                "source": 255 if page < 2 else 0,
-                "cursor": 1795171785523 - page if page < 2 else 0,
+                "source": 255 if page < 2 else end_source,
+                "cursor": 1795171785523 - page if page < 2 else end_cursor,
             },
         )
 
@@ -296,6 +299,26 @@ def test_paginated_history_never_queues_replies_even_on_later_webhook(settings: 
     assert ingest_event(settings, incoming("old-1")) == "duplicate"
     assert len(rows(settings, "jobs")) == 1
     assert [row["imported"] for row in rows(settings, "messages")] == [0, 1, 1]
+
+
+@pytest.mark.parametrize("source", [0, 255])
+def test_empty_history_with_null_cursor_finishes_without_more_requests(
+    settings: Settings, source: int
+) -> None:
+    ingest_event(settings, incoming())
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json={"messages": [], "source": source, "cursor": None})
+
+    async def run() -> None:
+        async with UmnicoClient(settings, transport=httpx.MockTransport(handler)) as client:
+            assert await import_history(settings, client, 1) == 0
+
+    asyncio.run(run())
+    assert calls == [{}]
+    assert len(rows(settings, "messages")) == len(rows(settings, "jobs")) == 1
 
 
 def test_history_backfills_login_from_existing_messages_without_new_jobs(

@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from loguru import logger
 
 from ai_consultant_bot.api_http import APIError
 from ai_consultant_bot.config import Settings
@@ -269,7 +270,12 @@ def test_manager_and_thread_paths_preserve_only_needed_channel_fields() -> None:
     "source,cursor,messages,error",
     [
         (0, 0, [], None),
+        (0, None, [], None),
+        (255, None, [], None),
         (255, 1795171785523, [{"messageId": "old"}], None),
+        (99, None, [], "invalid_history_response"),
+        (True, None, [], "invalid_history_response"),
+        (255, None, [{"messageId": "old"}], "invalid_history_response"),
         (255, "1795171785523", [], "invalid_history_response"),
         (255, True, [], "invalid_history_response"),
         (True, 0, [], "invalid_history_response"),
@@ -302,9 +308,62 @@ def test_history_page_end_and_source_validation(
             else:
                 page = await client.history_page("456", "255", cursor=1795171785523)
                 assert page["source"] == source
+                assert page["cursor"] == (0 if cursor is None else cursor)
 
     asyncio.run(run())
     assert calls == [{"cursor": 1795171785523}]
+
+
+@pytest.mark.parametrize(
+    "payload,diagnostics",
+    [
+        (["private-body"], ["response_type=list", "messages_type=missing"]),
+        ({"messages": [], "cursor": 0}, ["source_type=missing"]),
+        (
+            {"messages": [], "cursor": "private-cursor", "source": 255},
+            ["cursor_type=str", "source_type=int"],
+        ),
+        ({"messages": [], "source": 255}, ["cursor_type=missing"]),
+        (
+            {"messages": [{"messageId": "private-id"}], "cursor": None, "source": 255},
+            ["cursor_type=NoneType"],
+        ),
+        ({"messages": [], "cursor": -123, "source": 255}, ["cursor_negative=True"]),
+        ({"messages": [], "cursor": 0, "source": True}, ["source_type=bool"]),
+        (
+            {"messages": {"private-key": "private-text"}, "cursor": 0, "source": 255},
+            ["messages_type=dict"],
+        ),
+        (
+            {"messages": ["private-text", {"token": "private-token"}, None], "cursor": 1},
+            ["message_item_types=['NoneType', 'dict', 'str']", "source_type=missing"],
+        ),
+    ],
+)
+def test_invalid_history_diagnostics_do_not_log_values(payload: object, diagnostics: list) -> None:
+    calls = []
+    logs = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=payload)
+
+    async def run() -> None:
+        async with UmnicoClient(
+            Settings(umnico_api_key="private-api-key"), transport=httpx.MockTransport(handler)
+        ) as client:
+            with pytest.raises(APIError, match="invalid_history_response"):
+                await client.history_page("456", "255")
+
+    sink = logger.add(logs.append, format="{message}")
+    try:
+        asyncio.run(run())
+    finally:
+        logger.remove(sink)
+    assert len(calls) == 1 and len(logs) == 1
+    output = str(logs[0])
+    assert all(item in output for item in diagnostics)
+    assert all(value not in output for value in ("private-", "456", "255", "-123", "token"))
 
 
 @pytest.mark.parametrize("cursor", [0, -1, True, "123"])

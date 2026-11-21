@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
+from loguru import logger
 
 from ai_consultant_bot.api_http import APIError, create_http_client, request_json
 from ai_consultant_bot.config import Settings
@@ -80,6 +81,30 @@ def parse_token(payload: Any) -> AccessToken:
         return AccessToken(normalize_jwt(raw), parsed)
     except (KeyError, ValueError):
         raise APIError("umnico", "invalid_token_response") from None
+
+
+def log_history_response_shape(data: Any) -> None:
+    """Log only fixed field names and JSON types, never values or arbitrary keys."""
+    fields = data if isinstance(data, dict) else {}
+    field_types = {
+        name: type(fields[name]).__name__ if name in fields else "missing"
+        for name in ("messages", "cursor", "source")
+    }
+    messages = fields.get("messages")
+    item_types = (
+        sorted({type(item).__name__ for item in messages}) if isinstance(messages, list) else []
+    )
+    cursor = fields.get("cursor")
+    logger.warning(
+        "Некорректный формат истории Umnico: response_type={}; messages_type={}; "
+        "message_item_types={}; cursor_type={}; cursor_negative={}; source_type={}.",
+        type(data).__name__,
+        field_types["messages"],
+        item_types,
+        field_types["cursor"],
+        cursor < 0 if type(cursor) is int else None,
+        field_types["source"],
+    )
 
 
 class UmnicoClient:
@@ -259,6 +284,18 @@ class UmnicoClient:
             f"v2/messaging/{lead_id}/history/{source_real_id}",
             body={} if cursor is None else {"cursor": cursor},
         )
+        # An empty page can end with a null cursor, retaining the requested source.
+        # Normalize only this explicit end marker; missing cursors stay invalid.
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("messages"), list)
+            and not data["messages"]
+            and "cursor" in data
+            and data["cursor"] is None
+            and type(data.get("source")) is int
+            and data["source"] in {0, int(source_real_id)}
+        ):
+            return {**data, "cursor": 0}
         if (
             not isinstance(data, dict)
             or not isinstance(data.get("messages"), list)
@@ -267,6 +304,7 @@ class UmnicoClient:
             or data["cursor"] < 0
             or type(data.get("source")) is not int
         ):
+            log_history_response_shape(data)
             raise APIError("umnico", "invalid_history_response")
         if not data["messages"]:
             if data["source"] != 0 or data["cursor"] != 0:

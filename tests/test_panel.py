@@ -230,6 +230,44 @@ def test_panel_http_errors_are_safe(status: int) -> None:
     assert "private-" not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    "response,expected",
+    [
+        (
+            httpx.Response(
+                409,
+                json={"error_code": "invalid_history_response", "detail": "private-body"},
+            ),
+            "Umnico вернул неожиданный формат ответа",
+        ),
+        (httpx.Response(409, json={"error_code": "private-code"}), "разделе «Состояние»"),
+        (httpx.Response(409, json={"error_code": ["private-code"]}), "разделе «Состояние»"),
+        (httpx.Response(409, json=["private-body"]), "разделе «Состояние»"),
+        (httpx.Response(409, text="private-invalid-json"), "разделе «Состояние»"),
+    ],
+)
+def test_panel_history_conflict_is_specific_and_safe(
+    response: httpx.Response, expected: str
+) -> None:
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return response
+
+    with pytest.raises(PanelError) as caught:
+        admin_request(
+            Settings(admin_token="private-token"),
+            "POST",
+            "chats/1/import-history",
+            transport=httpx.MockTransport(handler),
+        )
+    message = str(caught.value)
+    assert "Не удалось импортировать историю" in message and expected in message
+    assert "пауз" not in message and "private-" not in message
+    assert len(calls) == 1
+
+
 def test_panel_launcher_is_local_and_has_no_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings(admin_token="private-admin")
     monkeypatch.setattr("ai_consultant_bot.panel_startup.load_settings", lambda: settings)
