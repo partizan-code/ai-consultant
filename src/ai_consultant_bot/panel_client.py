@@ -52,6 +52,11 @@ def admin_request(
             503: "Backend не готов: проверьте ADMIN_TOKEN и доступность SQLite.",
         }
         if response.status_code == 409:
+            if path == "knowledge/reload":
+                messages[409] = (
+                    "Не удалось обновить базу знаний. Проверьте доступность файлов и кодировку "
+                    "UTF-8. Предыдущая загруженная версия сохранена."
+                )
             if path.endswith("/import-history"):
                 messages[409] = (
                     "Не удалось импортировать историю. Проверьте код ошибки в разделе «Состояние»."
@@ -60,6 +65,17 @@ def admin_request(
                 error = response.json()
             except ValueError:
                 error = None
+            if path == "knowledge/reload" and isinstance(error, dict):
+                detail = error.get("detail")
+                if (
+                    isinstance(detail, dict)
+                    and detail.get("error_code") == "knowledge_limit_exceeded"
+                ):
+                    messages[409] = (
+                        "Превышен лимит объёма или числа файлов базы знаний. "
+                        "Уменьшите базу и повторите обновление. "
+                        "Предыдущая загруженная версия сохранена."
+                    )
             if isinstance(error, dict) and error.get("error_code") == "invalid_history_response":
                 messages[409] = (
                     "Не удалось импортировать историю: Umnico вернул неожиданный формат ответа. "

@@ -57,9 +57,9 @@ class Settings:
     history_context_messages: int = 30
     history_context_chars: int = 16000
     knowledge_file_max_bytes: int = 1_048_576
-    knowledge_max_chunks: int = 2000
-    knowledge_chunk_chars: int = 1500
-    knowledge_search_results: int = 4
+    knowledge_max_chars: int = 50_000
+    knowledge_max_documents: int = 100
+    post_context_chars: int = 1500
     consultation_reply_max_chars: int = 4000
     lead_field_max_chars: int = 300
     panel_host: str = "127.0.0.1"
@@ -96,9 +96,9 @@ class Settings:
             "history_context_messages",
             "history_context_chars",
             "knowledge_file_max_bytes",
-            "knowledge_max_chunks",
-            "knowledge_chunk_chars",
-            "knowledge_search_results",
+            "knowledge_max_chars",
+            "knowledge_max_documents",
+            "post_context_chars",
             "consultation_reply_max_chars",
             "lead_field_max_chars",
             "panel_page_size",

@@ -51,7 +51,7 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         if path == "status":
             return state.status
         if path == "knowledge/reload":
-            return {"chunks": 2}
+            return {"documents": 2}
         if path == "chats" or path.startswith("chats?offset="):
             offset = int(path.partition("offset=")[2] or 0)
             return {
@@ -137,7 +137,7 @@ def test_panel_settings_status_and_reload(backend: SimpleNamespace) -> None:
     button(app, "Сохранить настройки").click().run()
     assert backend.settings == {"model": "new/model"}
     button(app, "Обновить базу знаний").click().run()
-    assert any("фрагментов — 2" in item.value for item in app.success)
+    assert any("документов — 2" in item.value for item in app.success)
     app.radio(key="panel_section").set_value("Состояние").run()
     assert not app.exception and len(app.warning) == 1
 
@@ -298,6 +298,32 @@ def test_panel_http_auth_loopback_and_no_retry() -> None:
         )
     assert len(calls) == 1
     assert "private-" not in str(caught.value)
+
+
+@pytest.mark.parametrize("limit", [False, True])
+def test_panel_knowledge_reload_errors_are_specific_and_safe(limit: bool) -> None:
+    def handler(request):
+        return httpx.Response(
+            409,
+            json={
+                "detail": {
+                    "error_code": "knowledge_limit_exceeded" if limit else "other",
+                    "message": "private-body",
+                }
+            },
+        )
+
+    with pytest.raises(PanelError) as caught:
+        admin_request(
+            Settings(admin_token="synthetic-admin"),
+            "POST",
+            "knowledge/reload",
+            transport=httpx.MockTransport(handler),
+        )
+    message = str(caught.value)
+    assert "Предыдущая загруженная версия сохранена" in message
+    assert ("Превышен лимит" if limit else "UTF-8") in message
+    assert "private-body" not in message
 
 
 @pytest.mark.parametrize("status", [302, 400, 401, 404, 409, 503])

@@ -246,6 +246,36 @@ def test_history_send_and_outgoing_webhook_through_admin_api(tmp_path: Path) -> 
         assert connection.execute("SELECT paused FROM chats").fetchone()[0] == 1
 
 
+def test_knowledge_limit_error_preserves_snapshot(tmp_path: Path) -> None:
+    settings = Settings(
+        database_path=tmp_path / "test.sqlite3",
+        knowledge_base_path=tmp_path / "knowledge",
+        knowledge_max_chars=10,
+        admin_token="synthetic-admin",
+    )
+    settings.knowledge_base_path.mkdir()
+    (settings.knowledge_base_path / "valid.md").write_text("диван", encoding="utf-8")
+    app = create_app(settings, transport=httpx.MockTransport(lambda request: pytest.fail("HTTP")))
+
+    async def run() -> None:
+        async with app.router.lifespan_context(app):
+            snapshot = app.state.knowledge.documents
+            (settings.knowledge_base_path / "extra.md").write_text("x" * 6, encoding="utf-8")
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                response = await client.post(
+                    "/admin/knowledge/reload",
+                    headers={"Authorization": "Bearer synthetic-admin"},
+                )
+            assert response.status_code == 409
+            assert response.json()["detail"]["error_code"] == "knowledge_limit_exceeded"
+            assert "10 символов" in response.json()["detail"]["message"]
+            assert app.state.knowledge.documents is snapshot
+
+    asyncio.run(run())
+
+
 def test_worker_lifecycle_and_authenticated_knowledge_reload(tmp_path: Path) -> None:
     settings = Settings(
         database_path=tmp_path / "test.sqlite3",
@@ -285,10 +315,10 @@ def test_worker_lifecycle_and_authenticated_knowledge_reload(tmp_path: Path) -> 
                 url = "/admin/knowledge/reload"
                 assert (await client.post(url)).status_code == 401
                 headers = {"Authorization": "Bearer synthetic-admin"}
-                assert (await client.post(url, headers=headers)).json() == {"chunks": 1}
+                assert (await client.post(url, headers=headers)).json() == {"documents": 1}
                 (settings.knowledge_base_path / "invalid.txt").write_bytes(b"\xff")
                 assert (await client.post(url, headers=headers)).status_code == 409
-                assert len(app.state.knowledge.chunks) == 1
+                assert len(app.state.knowledge.documents) == 1
                 await client.post("/webhooks/umnico/synthetic-hook", json=incoming())
                 await asyncio.wait_for(completed.wait(), timeout=2)
                 with open_database(settings.database_path, timeout=1) as connection:

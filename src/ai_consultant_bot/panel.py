@@ -629,7 +629,7 @@ def show_settings(settings: Settings) -> None:
             st.success("Настройки сохранены.")
     if st.button("Обновить базу знаний"):
         result = admin_request(settings, "POST", "knowledge/reload")
-        st.success(f"База знаний обновлена: фрагментов — {result['chunks']}.")
+        st.success(f"База знаний обновлена: документов — {result['documents']}.")
 
 
 def show_settings_updates(settings: Settings) -> None:

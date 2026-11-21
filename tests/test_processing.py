@@ -95,7 +95,7 @@ async def process(settings: Settings, handler, knowledge: KnowledgeBase | None =
 
 
 @pytest.mark.parametrize("knowledge_state", ["missing", "empty", "unrelated"])
-def test_model_reply_and_partial_lead_without_matching_facts(
+def test_model_reply_and_partial_lead_with_any_knowledge_state(
     settings: Settings, knowledge_state: str
 ) -> None:
     if knowledge_state != "missing":
@@ -116,8 +116,13 @@ def test_model_reply_and_partial_lead_without_matching_facts(
         body = json.loads(request.content)
         calls.append(body)
         assert body["model"] == "chosen/model"
-        payload = json.loads(body["messages"][1]["content"])
-        assert payload["knowledge"] == []
+        knowledge = json.loads(body["messages"][1]["content"])["knowledge"]
+        assert knowledge == (
+            [{"source": "care.txt", "text": "Уход: сухая чистка."}]
+            if knowledge_state == "unrelated"
+            else []
+        )
+        payload = json.loads(body["messages"][2]["content"])
         assert payload["known_lead"]["phone"] == "+375290000000"
         return completion(reply, name="Анна", city="Минск", furniture_type="диван", phone=None)
 
@@ -135,7 +140,7 @@ def test_model_reply_and_partial_lead_without_matching_facts(
     assert rows(settings, "api_calls")[0]["service"] == "openrouter"
 
 
-def test_matching_knowledge_and_imported_history_are_context_only(settings: Settings) -> None:
+def test_knowledge_and_imported_history_are_context_only(settings: Settings) -> None:
     ingest_event(settings, event())
     old = event("old", "Мой бюджет 2000")
     old["message"]["datetime"] = "2026-11-19T10:00:00Z"
@@ -146,15 +151,36 @@ def test_matching_knowledge_and_imported_history_are_context_only(settings: Sett
     (settings.knowledge_base_path / "sofa.md").write_text("Диван Альфа: велюр.", encoding="utf-8")
 
     def handler(request: httpx.Request) -> httpx.Response:
-        data = json.loads(json.loads(request.content)["messages"][1]["content"])
+        messages = json.loads(request.content)["messages"]
+        data = json.loads(messages[2]["content"])
         assert data["history"][0]["text"] == "Мой бюджет 2000"
-        assert data["knowledge"][0]["text"] == "Диван Альфа: велюр."
+        assert json.loads(messages[1]["content"])["knowledge"][0]["text"] == "Диван Альфа: велюр."
         return completion("У дивана Альфа обивка велюр.", budget="2000")
 
     asyncio.run(process(settings, handler))
     assert rows(settings, "suggestions")[0]["text"] == "У дивана Альфа обивка велюр."
     assert len(rows(settings, "jobs")) == 1
     assert rows(settings, "leads")[0]["budget"] == "2000"
+
+
+def test_entire_knowledge_reaches_model_without_keyword_matches(settings: Settings) -> None:
+    ingest_event(settings, event(text="Здравствуйте"))
+    settings.knowledge_base_path.mkdir()
+    documents = []
+    for index in range(6):
+        text = f"# Раздел {index}\n" + "Материалы и условия.\n" * 100 + f"КОНЕЦ {index}"
+        source = f"section-{index}.md"
+        (settings.knowledge_base_path / source).write_bytes(text.encode("utf-8"))
+        documents.append({"source": source, "text": text})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        messages = json.loads(request.content)["messages"]
+        assert json.loads(messages[1]["content"]) == {"knowledge": documents}
+        assert json.loads(messages[2]["content"])["history"][-1]["text"] == "Здравствуйте"
+        return completion()
+
+    assert asyncio.run(process(settings, handler))
+    assert rows(settings, "jobs")[0]["status"] == "done"
 
 
 @pytest.mark.parametrize("outcome", ["sent", "unknown", "failed"])
@@ -215,7 +241,7 @@ def test_comment_uses_direct_history_and_lead_without_auto_sending(settings: Set
 
     def handler(request):
         assert request.url.path.endswith("chat/completions")
-        content = json.loads(json.loads(request.content)["messages"][1]["content"])
+        content = json.loads(json.loads(request.content)["messages"][2]["content"])
         assert [item["text"] for item in content["history"]] == [
             "Я Анна, нужен диван",
             "А этот подойдёт?",
@@ -361,14 +387,14 @@ def test_trigger_is_retained_in_bounded_history(settings: Settings) -> None:
         store_event(connection, parse_event(future), imported=True)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        payload = json.loads(json.loads(request.content)["messages"][1]["content"])
+        payload = json.loads(json.loads(request.content)["messages"][2]["content"])
         assert payload["history"] == [{"direction": "incoming", "text": "Диван Минск"}]
         return completion(city="Минск")
 
     asyncio.run(process(settings, handler))
 
 
-def test_comment_post_is_used_for_search_not_lead_evidence(settings: Settings) -> None:
+def test_comment_post_and_knowledge_are_not_lead_evidence(settings: Settings) -> None:
     comment = event(text="Расскажите подробнее", source="comment")
     comment["message"]["preview"] = {"description": "Диван Альфа", "owner": "shop"}
     ingest_event(settings, comment)
@@ -376,8 +402,9 @@ def test_comment_post_is_used_for_search_not_lead_evidence(settings: Settings) -
     (settings.knowledge_base_path / "sofas.txt").write_text("Диван Альфа: велюр.", encoding="utf-8")
 
     def handler(request: httpx.Request) -> httpx.Response:
-        data = json.loads(json.loads(request.content)["messages"][1]["content"])
-        assert data["knowledge"][0]["text"] == "Диван Альфа: велюр."
+        messages = json.loads(request.content)["messages"]
+        data = json.loads(messages[2]["content"])
+        assert json.loads(messages[1]["content"])["knowledge"][0]["text"] == "Диван Альфа: велюр."
         assert data["post"]["post_description"] == "Диван Альфа"
         return completion("Диван Альфа в велюре.", furniture_type="диван")
 

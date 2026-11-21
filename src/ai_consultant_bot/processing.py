@@ -65,34 +65,14 @@ async def process_next_job(
     if not context:
         return True
     try:
-        query = " ".join(
-            item["text"] for item in context["history"] if item["direction"] == "incoming"
-        )
-        # The newest question has priority; known furniture also helps short follow-ups.
-        latest = next(
-            (
-                item["text"]
-                for item in reversed(context["history"])
-                if item["direction"] == "incoming"
-            ),
-            "",
-        )
-        facts = knowledge.search(
-            " ".join(
-                (
-                    latest,
-                    context["lead"].furniture_type or "",
-                    context["post"].get("post_description") or "",
-                )
-            )
-        )
-        if not facts:
-            facts = knowledge.search(query)
+        documents = knowledge.documents
         model = context.pop("model")
         started = monotonic()
         error_code, status_code = None, None
         try:
-            raw = await openrouter.complete(build_prompt(**context, knowledge=facts), model=model)
+            raw = await openrouter.complete(
+                build_prompt(**context, knowledge=documents), model=model
+            )
             status_code = 200
             result = parse_consultation(raw, context["history"], settings)
         except APIError as error:

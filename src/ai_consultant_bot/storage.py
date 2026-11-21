@@ -514,7 +514,7 @@ def load_consultation_context(
         "history": list(reversed(history)),
         "lead": get_conversation_lead(connection, job["chat_id"]),
         "source_type": chat["source_type"],
-        "post": {key: (post[key] or "")[: settings.knowledge_chunk_chars] for key in post.keys()}
+        "post": {key: (post[key] or "")[: settings.post_context_chars] for key in post.keys()}
         if post
         else {},
         "model": get_setting(connection, "model"),

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import csv
 import json
 import secrets
 import sqlite3
@@ -27,7 +26,7 @@ from ai_consultant_bot.admin import (
 )
 from ai_consultant_bot.api_http import APIError
 from ai_consultant_bot.config import Settings
-from ai_consultant_bot.knowledge import KnowledgeBase
+from ai_consultant_bot.knowledge import KnowledgeBase, KnowledgeLimitError
 from ai_consultant_bot.messaging import (
     import_conversation_history,
     ingest_event,
@@ -62,7 +61,7 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
         knowledge = KnowledgeBase(settings)
         try:
             await run_in_threadpool(knowledge.reload)
-        except (OSError, ValueError, csv.Error):
+        except (OSError, ValueError):
             logger.warning(
                 "База знаний не загружена; консультации доступны без сведений о товарах."
             )
@@ -162,12 +161,20 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
     async def reload_knowledge(request: Request) -> dict[str, int]:
         try:
             count = await run_in_threadpool(request.app.state.knowledge.reload)
-        except (OSError, ValueError, csv.Error):
+        except KnowledgeLimitError as exc:
+            raise HTTPException(
+                409,
+                {
+                    "error_code": "knowledge_limit_exceeded",
+                    "message": f"{exc} Предыдущая версия базы знаний сохранена.",
+                },
+            ) from None
+        except (OSError, ValueError):
             raise HTTPException(
                 409, "Knowledge reload failed; previous snapshot retained"
             ) from None
-        logger.info("База знаний обновлена: фрагментов — {}.", count)
-        return {"chunks": count}
+        logger.info("База знаний обновлена: документов — {}.", count)
+        return {"documents": count}
 
     @app.post("/webhooks/umnico/{token}")
     async def webhook(token: str, request: Request) -> dict[str, str]:
