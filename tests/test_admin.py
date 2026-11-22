@@ -14,7 +14,7 @@ from ai_consultant_bot.config import Settings
 from ai_consultant_bot.knowledge import KnowledgeBase
 from ai_consultant_bot.messaging import ingest_event
 from ai_consultant_bot.openrouter import OpenRouterClient
-from ai_consultant_bot.processing import process_next_job
+from ai_consultant_bot.processing import generate_suggestion, process_next_job
 from ai_consultant_bot.storage import (
     Lead,
     initialize_database,
@@ -95,14 +95,84 @@ async def api(settings: Settings, handler=no_network):
             yield client
 
 
-def make_suggestion(settings: Settings, source: str = "message") -> None:
+def make_conversation(settings: Settings, source: str = "message") -> None:
     ingest_event(settings, event(source=source))
     with open_database(settings.database_path, timeout=1) as connection, connection:
         connection.execute("UPDATE jobs SET status = 'done'")
-        connection.execute(
-            "INSERT INTO suggestions(conversation_id, message_id, text) VALUES (1, 1, 'Ответ')"
-        )
         save_lead(connection, 1, Lead(name="Анна", phone="+375290000000"))
+
+
+@pytest.mark.parametrize("source", ["message", "comment"])
+def test_suggestion_api_generates_fresh_text_only_on_request(
+    settings: Settings, source: str
+) -> None:
+    settings = replace(settings, openrouter_api_key="synthetic-openrouter")
+    ingest_event(settings, event(source=source))
+    calls = []
+
+    def handler(request):
+        assert request.url.path.endswith("chat/completions")
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps({"reply": f"Ответ {len(calls)}", "lead": {}})
+                        },
+                    }
+                ]
+            },
+        )
+
+    async def run():
+        async with api(settings, handler) as client:
+            for _ in range(2):
+                detail = await client.get("/admin/chats/1", headers=HEADERS)
+                assert "suggestion" not in detail.json()
+            assert not calls
+            for index in range(1, 3):
+                response = await client.post("/admin/chats/1/suggestion", headers=HEADERS)
+                assert response.status_code == 200
+                assert response.json() == {"text": f"Ответ {index}"}
+            assert (
+                await client.post("/admin/chats/999/suggestion", headers=HEADERS)
+            ).status_code == 404
+            set_pause(settings, 1, False)
+            assert (
+                await client.post("/admin/chats/1/suggestion", headers=HEADERS)
+            ).status_code == 409
+        assert len(calls) == 2
+        assert not chat_detail(settings, 1)["attempts"]
+        with open_database(settings.database_path, timeout=1) as connection:
+            assert not connection.execute("SELECT 1 FROM jobs").fetchone()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["empty", "model", "staging"])
+def test_suggestion_api_errors_without_saving_or_sending(settings: Settings, failure: str) -> None:
+    settings = replace(settings, openrouter_api_key="synthetic-openrouter")
+    if failure == "empty":
+        payload = event()
+        payload["message"]["message"]["text"] = ""
+        ingest_event(settings, payload)
+    else:
+        ingest_event(settings, event())
+    if failure == "staging":
+        settings = replace(settings, environment="staging")
+
+    async def run():
+        async with api(settings, lambda request: httpx.Response(500)) as client:
+            response = await client.post("/admin/chats/1/suggestion", headers=HEADERS)
+            assert response.status_code == 409
+        with open_database(settings.database_path, timeout=1) as connection:
+            assert not connection.execute("SELECT 1 FROM leads").fetchone()
+            assert not connection.execute("SELECT 1 FROM outgoing_attempts").fetchone()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(
@@ -114,6 +184,7 @@ def make_suggestion(settings: Settings, source: str = "message") -> None:
         ("GET", "chats/1", None),
         ("GET", "status", None),
         ("POST", "chats/1/pause", {"paused": True}),
+        ("POST", "chats/1/suggestion", None),
     ],
 )
 @pytest.mark.parametrize("token,code", [("synthetic-admin", 401), ("", 503)])
@@ -129,7 +200,7 @@ def test_admin_auth(
 
 
 def test_chat_lead_comment_and_pagination(settings: Settings) -> None:
-    make_suggestion(settings, source="comment")
+    make_conversation(settings, source="comment")
     ingest_event(settings, event("second", source="comment"))
     ingest_event(settings, event("third", source="comment"))
 
@@ -142,7 +213,6 @@ def test_chat_lead_comment_and_pagination(settings: Settings) -> None:
             assert data["reply_block_reason"] == "comment_private_reply_unverified"
             assert data["message_total"] == 3 and len(data["messages"]) == 2
             assert data["messages"][0]["post_description"] == "Наш диван"
-            assert data["suggestion"] is None
             older = (await client.get("/admin/chats/1?offset=2", headers=HEADERS)).json()
             assert len(older["messages"]) == 1 and older["messages"][0]["external_id"] == "first"
             assert (await client.get("/admin/chats/999", headers=HEADERS)).status_code == 404
@@ -152,7 +222,7 @@ def test_chat_lead_comment_and_pagination(settings: Settings) -> None:
 
 
 def test_instagram_profile_does_not_replace_lead_name(settings: Settings) -> None:
-    make_suggestion(settings)
+    make_conversation(settings)
     with open_database(settings.database_path, timeout=1) as connection, connection:
         # A database from the previous version may contain an unused name cache.
         connection.execute(
@@ -172,7 +242,6 @@ def test_instagram_profile_does_not_replace_lead_name(settings: Settings) -> Non
             detail = (await client.get("/admin/chats/1", headers=HEADERS)).json()
             assert detail["chat"]["instagram_username"] == "anna.instagram"
             assert detail["lead"]["name"] == "Анна"
-            assert detail["suggestion"]["text"] == "Ответ"
 
     asyncio.run(run())
     with open_database(settings.database_path, timeout=1) as connection:
@@ -242,17 +311,15 @@ def test_model_persists_and_next_generation_uses_it(settings: Settings) -> None:
                 replace(settings, openrouter_api_key="synthetic"),
                 transport=httpx.MockTransport(handler),
             ) as router,
-            UmnicoClient(settings, transport=httpx.MockTransport(no_network)) as umnico,
         ):
-            assert await process_next_job(settings, knowledge, router, umnico)
-        assert chat_detail(settings, 1)["suggestion"]["text"]
+            assert await generate_suggestion(settings, knowledge, router, 1) == "Что нужно?"
 
     asyncio.run(run())
 
 
 @pytest.mark.parametrize("outcome", ["sent", "unknown", "failed"])
 def test_manual_replay_and_late_receipt(settings: Settings, outcome: str) -> None:
-    make_suggestion(settings)
+    make_conversation(settings)
     calls = []
 
     def handler(request):
@@ -272,7 +339,6 @@ def test_manual_replay_and_late_receipt(settings: Settings, outcome: str) -> Non
             assert (await client.post(url, headers=HEADERS, json=body)).json() == first.json()
             data = chat_detail(settings, 1)
             assert data["chat"]["paused"] == 1
-            assert (data["suggestion"] is None) == (outcome == "sent")
             if outcome == "unknown":
                 denied = await client.post(
                     url, headers=HEADERS, json={"request_id": "new", "text": "Ещё"}
@@ -286,7 +352,6 @@ def test_manual_replay_and_late_receipt(settings: Settings, outcome: str) -> Non
                 assert (await client.post(url, headers=HEADERS, json=body)).json()[
                     "status"
                 ] == "sent"
-                assert chat_detail(settings, 1)["suggestion"] is None
             status = (await client.get("/admin/status", headers=HEADERS)).json()
             assert status["calls"][0]["operation"] == "send_text"
 
@@ -296,6 +361,8 @@ def test_manual_replay_and_late_receipt(settings: Settings, outcome: str) -> Non
 
 @pytest.mark.parametrize("action", ["pause_resume", "manual"])
 def test_pause_or_manual_answer_invalidates_generation(settings: Settings, action: str) -> None:
+    ingest_event(settings, event("setup"))
+    set_pause(settings, 1, False)
     ingest_event(settings, event())
     sent = []
 
@@ -356,16 +423,14 @@ def test_pause_or_manual_answer_invalidates_generation(settings: Settings, actio
             ):
                 assert await process_next_job(settings, KnowledgeBase(settings), router, umnico)
             data = chat_detail(settings, 1)
-            assert data["suggestion"] is None and bool(data["chat"]["paused"]) == (
-                action == "manual"
-            )
+            assert bool(data["chat"]["paused"]) == (action == "manual")
 
     asyncio.run(run())
     assert len(sent) == (1 if action == "manual" else 0)
 
 
-def test_pause_api_validates_and_activation_clears_suggestion(settings: Settings) -> None:
-    make_suggestion(settings)
+def test_pause_api_validates_and_activation_waits_for_incoming(settings: Settings) -> None:
+    make_conversation(settings)
 
     async def run():
         async with api(settings) as client:
@@ -379,7 +444,6 @@ def test_pause_api_validates_and_activation_clears_suggestion(settings: Settings
             assert (await client.post(url, headers=HEADERS, json={"paused": False})).json() == {
                 "paused": False
             }
-            assert chat_detail(settings, 1)["suggestion"] is None
             assert (
                 await client.post("/admin/chats/999/pause", headers=HEADERS, json={"paused": True})
             ).status_code == 404
@@ -388,7 +452,7 @@ def test_pause_api_validates_and_activation_clears_suggestion(settings: Settings
 
 
 def test_manual_cannot_claim_internal_request_namespace(settings: Settings) -> None:
-    make_suggestion(settings)
+    make_conversation(settings)
 
     async def run():
         async with api(settings) as client:
@@ -411,7 +475,7 @@ def test_one_conversation_keeps_routes_and_sends_manual_reply_in_direct(
     first_source, second_source = (
         ("comment", "message") if comment_first else ("message", "comment")
     )
-    make_suggestion(settings, first_source)
+    make_conversation(settings, first_source)
     second = event("second", second_source)
     second["message"]["source"].update(id="second-source", realId=256)
     second["message"]["datetime"] = "2026-11-20T10:01:00Z"
@@ -419,9 +483,6 @@ def test_one_conversation_keeps_routes_and_sends_manual_reply_in_direct(
     second["message"]["preview"]["photo"] = "https://example.test/photo.jpg"
     ingest_event(settings, second)
     with open_database(settings.database_path, timeout=1) as connection, connection:
-        connection.execute(
-            "INSERT INTO suggestions(conversation_id, message_id, text) VALUES (1, 2, 'Новый ответ')"
-        )
         save_lead(connection, 2, Lead(city="Минск"))
     listing = list_chats(settings)
     assert listing["total"] == 1
@@ -457,10 +518,9 @@ def test_one_conversation_keeps_routes_and_sends_manual_reply_in_direct(
     assert len(sent) == 1
     detail = chat_detail(settings, 1)
     assert detail["attempts"][0]["chat_id"] == direct_id
-    assert detail["suggestion"] is None
     with open_database(settings.database_path, timeout=1) as connection:
         assert [row[0] for row in connection.execute("SELECT paused FROM chats")] == [1, 1]
-        assert {row[0] for row in connection.execute("SELECT status FROM jobs")} == {"done"}
+        assert not connection.execute("SELECT 1 FROM jobs WHERE status != 'done'").fetchone()
 
 
 @pytest.mark.parametrize("boundary", ["accountId", "leadId", "integration"])
@@ -542,7 +602,7 @@ def test_import_enriches_old_comment_photo_in_combined_conversation(settings: Se
     assert detail["message_total"] == 2
     assert detail["messages"][1]["post_photo_url"] == "https://example.test/old-post.jpg"
     with open_database(settings.database_path, timeout=1) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
 
 
 def test_manual_pauses_before_route_lookup_and_send(settings: Settings) -> None:

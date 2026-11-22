@@ -35,7 +35,7 @@ from ai_consultant_bot.messaging import (
 )
 from ai_consultant_bot.model_sandbox import ModelDialogue, load_model_settings
 from ai_consultant_bot.openrouter import OpenRouterClient
-from ai_consultant_bot.processing import run_worker
+from ai_consultant_bot.processing import generate_suggestion, run_worker
 from ai_consultant_bot.storage import initialize_database, open_database, recover_interrupted_jobs
 from ai_consultant_bot.umnico import UmnicoClient
 
@@ -186,6 +186,16 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
             return chat_detail(settings, chat_id, offset)
         except LookupError:
             raise HTTPException(404, "Chat not found") from None
+
+    @app.post("/admin/chats/{chat_id}/suggestion", dependencies=[Depends(require_admin)])
+    async def suggestion(chat_id: int, request: Request) -> dict[str, str]:
+        try:
+            text = await generate_suggestion(
+                settings, request.app.state.knowledge, request.app.state.openrouter, chat_id
+            )
+        except LookupError:
+            raise HTTPException(404, "Chat not found") from None
+        return {"text": text}
 
     @app.post("/admin/chats/{chat_id}/pause", dependencies=[Depends(require_admin)])
     async def pause(chat_id: int, request: Request) -> dict[str, bool]:

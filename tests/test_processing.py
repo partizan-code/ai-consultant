@@ -13,15 +13,15 @@ from ai_consultant_bot.api_http import APIError
 from ai_consultant_bot.config import Settings
 from ai_consultant_bot.events import parse_event
 from ai_consultant_bot.knowledge import KnowledgeBase
-from ai_consultant_bot.messaging import ingest_event, send_text
+from ai_consultant_bot.messaging import ingest_event
 from ai_consultant_bot.openrouter import OpenRouterClient
-from ai_consultant_bot.processing import process_next_job
+from ai_consultant_bot.processing import generate_suggestion, process_next_job
 from ai_consultant_bot.storage import (
     Lead,
-    claim_next_job,
     initialize_database,
     open_database,
     recover_interrupted_jobs,
+    save_chat,
     save_lead,
     set_setting,
     store_event,
@@ -62,7 +62,7 @@ def event(
 
 
 def rows(settings: Settings, table: str) -> list[dict]:
-    assert table in {"jobs", "suggestions", "leads", "chats", "api_calls", "outgoing_attempts"}
+    assert table in {"jobs", "leads", "chats", "api_calls", "outgoing_attempts"}
     with open_database(settings.database_path, timeout=1) as connection:
         return [dict(row) for row in connection.execute(f"SELECT * FROM {table}").fetchall()]
 
@@ -92,6 +92,51 @@ async def process(settings: Settings, handler, knowledge: KnowledgeBase | None =
         UmnicoClient(settings, transport=httpx.MockTransport(handler)) as umnico,
     ):
         return await process_next_job(settings, knowledge, router, umnico)
+
+
+async def suggest(settings: Settings, handler, knowledge: KnowledgeBase | None = None) -> str:
+    if knowledge is None:
+        knowledge = KnowledgeBase(settings)
+        knowledge.reload()
+    async with OpenRouterClient(settings, transport=httpx.MockTransport(handler)) as router:
+        return await generate_suggestion(settings, knowledge, router, 1)
+
+
+def activate(settings: Settings) -> None:
+    with open_database(settings.database_path, timeout=1) as connection, connection:
+        save_chat(connection, parse_event(event()).chat)
+    set_pause(settings, 1, False)
+
+
+@pytest.mark.parametrize("source", ["message", "comment"])
+def test_paused_incoming_and_pause_never_generate(settings: Settings, source: str) -> None:
+    ingest_event(settings, event(source=source))
+    set_pause(settings, 1, False)
+    ingest_event(settings, event("active", source=source))
+    set_pause(settings, 1, True)
+    ingest_event(settings, event("paused", source=source))
+    assert not asyncio.run(process(settings, lambda request: pytest.fail("No background request")))
+    assert not rows(settings, "leads") and not rows(settings, "outgoing_attempts")
+
+
+@pytest.mark.parametrize("change", ["incoming", "activate", "manual"])
+def test_requested_suggestion_rejects_changed_conversation(settings: Settings, change: str) -> None:
+    ingest_event(settings, event())
+
+    def handler(request):
+        if change == "activate":
+            set_pause(settings, 1, False)
+        else:
+            newer = event("newer", "Уточнение")
+            if change == "manual":
+                newer["type"] = "message.outgoing"
+                newer["message"]["incoming"] = False
+            ingest_event(settings, newer)
+        return completion(name="Анна")
+
+    with pytest.raises(APIError):
+        asyncio.run(suggest(settings, handler))
+    assert not rows(settings, "leads") and not rows(settings, "outgoing_attempts")
 
 
 @pytest.mark.parametrize("knowledge_state", ["missing", "empty", "unrelated"])
@@ -126,16 +171,13 @@ def test_model_reply_and_partial_lead_with_any_knowledge_state(
         assert payload["known_lead"]["phone"] == "+375290000000"
         return completion(reply, name="Анна", city="Минск", furniture_type="диван", phone=None)
 
-    assert asyncio.run(process(settings, handler))
-    assert not asyncio.run(process(settings, handler))
+    assert asyncio.run(suggest(settings, handler)) == reply
     assert ingest_event(settings, event()) == "duplicate"
     assert len(calls) == 1
     lead = rows(settings, "leads")[0]
     assert lead["name"] == "Анна" and lead["city"] == "Минск"
     assert lead["phone"] == "+375290000000" and lead["budget"] is None
-    suggestion = rows(settings, "suggestions")[0]
-    assert suggestion["text"] == reply
-    assert rows(settings, "jobs")[0]["status"] == "done"
+    assert not rows(settings, "jobs")
     assert rows(settings, "outgoing_attempts") == []
     assert rows(settings, "api_calls")[0]["service"] == "openrouter"
 
@@ -157,9 +199,8 @@ def test_knowledge_and_imported_history_are_context_only(settings: Settings) -> 
         assert json.loads(messages[1]["content"])["knowledge"][0]["text"] == "Диван Альфа: велюр."
         return completion("У дивана Альфа обивка велюр.", budget="2000")
 
-    asyncio.run(process(settings, handler))
-    assert rows(settings, "suggestions")[0]["text"] == "У дивана Альфа обивка велюр."
-    assert len(rows(settings, "jobs")) == 1
+    asyncio.run(suggest(settings, handler))
+    assert not rows(settings, "jobs")
     assert rows(settings, "leads")[0]["budget"] == "2000"
 
 
@@ -179,12 +220,13 @@ def test_entire_knowledge_reaches_model_without_keyword_matches(settings: Settin
         assert json.loads(messages[2]["content"])["history"][-1]["text"] == "Здравствуйте"
         return completion()
 
-    assert asyncio.run(process(settings, handler))
-    assert rows(settings, "jobs")[0]["status"] == "done"
+    assert asyncio.run(suggest(settings, handler))
+    assert not rows(settings, "jobs")
 
 
 @pytest.mark.parametrize("outcome", ["sent", "unknown", "failed"])
 def test_auto_send_no_pause_and_no_retry(settings: Settings, outcome: str) -> None:
+    activate(settings)
     ingest_event(settings, event("initial"))
     set_pause(settings, 1, False)
     ingest_event(settings, event())
@@ -205,7 +247,6 @@ def test_auto_send_no_pause_and_no_retry(settings: Settings, outcome: str) -> No
     asyncio.run(process(settings, handler))
     assert not asyncio.run(process(settings, handler))
     assert rows(settings, "chats")[0]["paused"] == 0
-    assert rows(settings, "suggestions") == []
     assert rows(settings, "jobs")[-1]["status"] == ("unknown" if outcome == "unknown" else "done")
     assert len(calls) == 2
     if outcome == "unknown":
@@ -216,28 +257,12 @@ def test_auto_send_no_pause_and_no_retry(settings: Settings, outcome: str) -> No
         assert rows(settings, "jobs")[0]["status"] == "done"
 
 
-def test_paused_comment_creates_suggestion_without_sending(settings: Settings) -> None:
-    ingest_event(settings, event(source="comment"))
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path.endswith("chat/completions")
-        return completion()
-
-    asyncio.run(process(settings, handler))
-    assert rows(settings, "suggestions")[0]["text"]
-    assert not rows(settings, "outgoing_attempts")
-
-
 def test_comment_uses_direct_history_and_lead_without_auto_sending(settings: Settings) -> None:
     ingest_event(settings, event("direct", "Я Анна, нужен диван"))
     with open_database(settings.database_path, timeout=1) as connection, connection:
         connection.execute("UPDATE jobs SET status = 'done'")
-        connection.execute(
-            "INSERT INTO suggestions(conversation_id, message_id, text) VALUES (1, 1, 'Старый')"
-        )
         save_lead(connection, 1, Lead(name="Анна", city="Минск"))
     ingest_event(settings, event("comment", "А этот подойдёт?", source="comment"))
-    assert rows(settings, "suggestions") == []
 
     def handler(request):
         assert request.url.path.endswith("chat/completions")
@@ -250,14 +275,12 @@ def test_comment_uses_direct_history_and_lead_without_auto_sending(settings: Set
         assert content["known_lead"]["city"] == "Минск"
         return completion()
 
-    asyncio.run(process(settings, handler))
-    assert len(rows(settings, "suggestions")) == 1
-    assert rows(settings, "suggestions")[-1]["conversation_id"] == 1
-    assert rows(settings, "suggestions")[-1]["message_id"] == 2
+    asyncio.run(suggest(settings, handler))
     assert not rows(settings, "outgoing_attempts")
 
 
 def test_comment_during_direct_generation_invalidates_old_reply(settings: Settings) -> None:
+    activate(settings)
     ingest_event(settings, event())
 
     def handler(request):
@@ -266,12 +289,13 @@ def test_comment_during_direct_generation_invalidates_old_reply(settings: Settin
         return completion()
 
     asyncio.run(process(settings, handler))
-    assert not rows(settings, "suggestions") and not rows(settings, "outgoing_attempts")
+    assert not rows(settings, "outgoing_attempts")
     assert [row["status"] for row in rows(settings, "jobs")] == ["done", "pending"]
 
 
-@pytest.mark.parametrize("change", ["incoming", "pause", "activate"])
+@pytest.mark.parametrize("change", ["incoming", "pause"])
 def test_changes_during_generation_prevent_stale_save(settings: Settings, change: str) -> None:
+    activate(settings)
     ingest_event(settings, event())
     if change == "pause":
         set_pause(settings, 1, False)
@@ -287,28 +311,14 @@ def test_changes_during_generation_prevent_stale_save(settings: Settings, change
 
     asyncio.run(process(settings, handler))
     assert not rows(settings, "outgoing_attempts")
-    assert rows(settings, "suggestions") == rows(settings, "leads") == []
+    assert rows(settings, "leads") == []
     if change == "pause":
-        # Reusing the same source job cannot let its previous generation write a result.
-        assert rows(settings, "jobs")[-1]["status"] == "pending"
-        asyncio.run(process(settings, lambda request: completion("Новая подсказка")))
-        assert rows(settings, "suggestions")[0]["text"] == "Новая подсказка"
-
-
-def test_stale_queued_job_cancelled_and_old_suggestion_removed(settings: Settings) -> None:
-    ingest_event(settings, event())
-    asyncio.run(process(settings, lambda request: completion()))
-    ingest_event(settings, event("second", "Кровать"))
-    ingest_event(settings, event("third", "Минск"))
-    assert rows(settings, "suggestions") == []
-
-    assert rows(settings, "jobs")[1]["status"] == "done"
-    asyncio.run(process(settings, lambda request: completion(city="Минск")))
-    assert len(rows(settings, "suggestions")) == 1
+        assert not asyncio.run(process(settings, lambda request: pytest.fail("Paused")))
 
 
 @pytest.mark.parametrize("error", ["json", "lead", "http", "cancel"])
 def test_generation_errors_do_not_save_lead_or_suggestion(settings: Settings, error: str) -> None:
+    activate(settings)
     ingest_event(settings, event())
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -333,7 +343,7 @@ def test_generation_errors_do_not_save_lead_or_suggestion(settings: Settings, er
     with pytest.raises(asyncio.CancelledError if error == "cancel" else APIError):
         asyncio.run(process(settings, handler))
     assert rows(settings, "jobs")[0]["status"] == "failed"
-    assert rows(settings, "suggestions") == rows(settings, "leads") == []
+    assert rows(settings, "leads") == []
     assert rows(settings, "api_calls")[0]["error_code"]
 
 
@@ -341,6 +351,7 @@ def test_generation_errors_do_not_save_lead_or_suggestion(settings: Settings, er
 def test_restart_retries_generation_but_never_uncertain_send(
     settings: Settings, state: str | None
 ) -> None:
+    activate(settings)
     ingest_event(settings, event())
     with open_database(settings.database_path, timeout=1) as connection, connection:
         connection.execute("UPDATE jobs SET status = 'processing'")
@@ -355,6 +366,7 @@ def test_restart_retries_generation_but_never_uncertain_send(
 
 
 def test_new_message_during_route_lookup_blocks_stale_auto_send(settings: Settings) -> None:
+    activate(settings)
     incoming = event()
     incoming["message"]["source"].pop("realId")
     initial = event("initial")
@@ -374,7 +386,6 @@ def test_new_message_during_route_lookup_blocks_stale_auto_send(settings: Settin
 
     asyncio.run(process(settings, handler))
     assert not rows(settings, "outgoing_attempts")
-    assert rows(settings, "suggestions") == []
 
 
 def test_trigger_is_retained_in_bounded_history(settings: Settings) -> None:
@@ -391,7 +402,7 @@ def test_trigger_is_retained_in_bounded_history(settings: Settings) -> None:
         assert payload["history"] == [{"direction": "incoming", "text": "Диван Минск"}]
         return completion(city="Минск")
 
-    asyncio.run(process(settings, handler))
+    asyncio.run(suggest(settings, handler))
 
 
 def test_comment_post_and_knowledge_are_not_lead_evidence(settings: Settings) -> None:
@@ -409,11 +420,12 @@ def test_comment_post_and_knowledge_are_not_lead_evidence(settings: Settings) ->
         return completion("Диван Альфа в велюре.", furniture_type="диван")
 
     with pytest.raises(APIError, match="invalid_consultation_response"):
-        asyncio.run(process(settings, handler))
+        asyncio.run(suggest(settings, handler))
     assert not rows(settings, "leads")
 
 
 def test_cancelled_auto_send_remains_unknown(settings: Settings) -> None:
+    activate(settings)
     ingest_event(settings, event("initial"))
     set_pause(settings, 1, False)
     ingest_event(settings, event())
@@ -426,23 +438,7 @@ def test_cancelled_auto_send_remains_unknown(settings: Settings) -> None:
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(process(settings, handler))
     assert rows(settings, "jobs")[-1]["status"] == "unknown"
-    assert rows(settings, "suggestions") == []
     assert rows(settings, "outgoing_attempts")[0]["status"] == "unknown"
-
-
-def test_each_paused_incoming_replaces_one_conversation_suggestion(settings: Settings) -> None:
-    for index, source in enumerate(["message", "comment", "message"], 1):
-        ingest_event(settings, event(str(index), source=source))
-        assert rows(settings, "suggestions") == []
-        asyncio.run(
-            process(settings, lambda request, index=index: completion(f"Подсказка {index}"))
-        )
-        suggestions = rows(settings, "suggestions")
-        assert len(suggestions) == 1
-        assert suggestions[0]["conversation_id"] == 1
-        assert suggestions[0]["message_id"] == index
-        assert suggestions[0]["text"] == f"Подсказка {index}"
-    assert not rows(settings, "outgoing_attempts")
 
 
 def test_activation_discards_queued_work_until_next_incoming(settings: Settings) -> None:
@@ -451,115 +447,15 @@ def test_activation_discards_queued_work_until_next_incoming(settings: Settings)
     assert not asyncio.run(
         process(settings, lambda request: pytest.fail("Activation must not send"))
     )
-    assert not rows(settings, "suggestions")
     # Active comments still extract a lead, but never send or expose a suggestion.
     ingest_event(settings, event("comment", source="comment"))
     asyncio.run(process(settings, lambda request: completion(name="Анна")))
-    assert not rows(settings, "suggestions") and not rows(settings, "outgoing_attempts")
+    assert not rows(settings, "outgoing_attempts")
     assert rows(settings, "leads")[0]["name"] == "Анна"
 
 
-def test_requeued_source_new_result_wins_over_late_old_generation(settings: Settings) -> None:
-    ingest_event(settings, event())
-
-    async def handler(request):
-        set_pause(settings, 1, False)
-        set_pause(settings, 1, True)
-        assert await process(
-            settings, lambda request: completion("Актуальная подсказка", city="Минск")
-        )
-        return completion("Устаревшая подсказка", name="Анна")
-
-    asyncio.run(process(settings, handler))
-    assert rows(settings, "suggestions")[0]["text"] == "Актуальная подсказка"
-    assert rows(settings, "leads")[0]["name"] is None
-    assert rows(settings, "jobs")[0]["status"] == "done"
-    assert not rows(settings, "outgoing_attempts")
-
-
-def test_manual_reply_consumes_source_until_new_incoming(settings: Settings) -> None:
-    ingest_event(settings, event())
-    asyncio.run(process(settings, lambda request: completion()))
-
-    async def run():
-        async with UmnicoClient(
-            settings,
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(200, json=[{"messageId": "sent"}])
-            ),
-        ) as client:
-            await send_text(
-                settings, client, chat_id=1, text="Ответ менеджера", request_id="manual"
-            )
-        assert not await process(settings, lambda request: pytest.fail("No new incoming"))
-        set_pause(settings, 1, False)
-        set_pause(settings, 1, True)
-        assert not await process(settings, lambda request: pytest.fail("Already answered"))
-        assert not rows(settings, "suggestions")
-        ingest_event(settings, event("next"))
-        await process(settings, lambda request: completion("Следующая подсказка"))
-
-    asyncio.run(run())
-    assert rows(settings, "chats")[0]["paused"] == 1
-    assert rows(settings, "suggestions")[0]["message_id"] == 2
-    assert len(rows(settings, "outgoing_attempts")) == 1
-
-
-def test_paused_uncertain_send_allows_suggestion_but_not_another_send(settings: Settings) -> None:
-    ingest_event(settings, event())
-    with open_database(settings.database_path, timeout=1) as connection, connection:
-        connection.execute(
-            "INSERT INTO outgoing_attempts(request_id, chat_id, message_id, text, status) "
-            "VALUES ('manual', 1, 1, 'Отправлен?', 'unknown')"
-        )
-    ingest_event(settings, event("next"))
-    asyncio.run(process(settings, lambda request: completion("Новая подсказка")))
-    assert rows(settings, "suggestions")[0]["message_id"] == 2
-    assert len(rows(settings, "outgoing_attempts")) == 1
-
-
-def test_pause_after_failed_auto_send_prepares_unanswered_suggestion(settings: Settings) -> None:
-    ingest_event(settings, event("first"))
-    set_pause(settings, 1, False)
-    ingest_event(settings, event("second"))
-
-    def handler(request):
-        if request.url.path.endswith("chat/completions"):
-            return completion()
-        return httpx.Response(400)
-
-    asyncio.run(process(settings, handler))
-    set_pause(settings, 1, True)
-    asyncio.run(process(settings, lambda request: completion("Подсказка после ошибки")))
-    assert rows(settings, "suggestions")[0]["text"] == "Подсказка после ошибки"
-    assert len(rows(settings, "outgoing_attempts")) == 1
-
-
-def test_late_manual_receipt_does_not_remove_newer_suggestion(settings: Settings) -> None:
-    ingest_event(settings, event())
-
-    async def handler(request):
-        ingest_event(settings, event("newer"))
-        assert await process(settings, lambda request: completion("Ответ на новое сообщение"))
-        receipt = event("sent", "Ответ на первое сообщение")
-        receipt["type"] = "message.outgoing"
-        receipt["message"].update(incoming=False, customId="manual")
-        ingest_event(settings, receipt)
-        return httpx.Response(200, json=[{"messageId": "sent"}])
-
-    async def run():
-        async with UmnicoClient(settings, transport=httpx.MockTransport(handler)) as client:
-            await send_text(
-                settings, client, chat_id=1, text="Ответ на первое сообщение", request_id="manual"
-            )
-
-    asyncio.run(run())
-    assert rows(settings, "suggestions")[0]["message_id"] == 2
-    assert rows(settings, "suggestions")[0]["text"] == "Ответ на новое сообщение"
-    assert rows(settings, "outgoing_attempts")[0]["status"] == "sent"
-
-
 def test_external_manager_reply_cancels_generation(settings: Settings) -> None:
+    activate(settings)
     ingest_event(settings, event())
 
     def handler(request):
@@ -570,32 +466,9 @@ def test_external_manager_reply_cancels_generation(settings: Settings) -> None:
         return completion("Запоздавший текст")
 
     asyncio.run(process(settings, handler))
-    assert not rows(settings, "suggestions") and not rows(settings, "leads")
+    assert not rows(settings, "leads")
     assert rows(settings, "chats")[0]["paused"] == 1
     assert not asyncio.run(process(settings, lambda request: pytest.fail("No unanswered input")))
-
-
-def test_recovery_retries_requeued_suggestion_after_failed_send(settings: Settings) -> None:
-    ingest_event(settings, event())
-    set_pause(settings, 1, False)
-    ingest_event(settings, event("second"))
-    asyncio.run(
-        process(
-            settings,
-            lambda request: (
-                completion()
-                if request.url.path.endswith("chat/completions")
-                else httpx.Response(400)
-            ),
-        )
-    )
-    set_pause(settings, 1, True)
-    with open_database(settings.database_path, timeout=1) as connection, connection:
-        job = claim_next_job(connection)
-        assert job["generation"] > 0
-        assert recover_interrupted_jobs(connection) == 1
-    asyncio.run(process(settings, lambda request: completion("Восстановленная подсказка")))
-    assert rows(settings, "suggestions")[0]["text"] == "Восстановленная подсказка"
 
 
 def test_payment_memory_survives_bounded_history(settings: Settings) -> None:
@@ -612,12 +485,12 @@ def test_payment_memory_survives_bounded_history(settings: Settings) -> None:
         assert payload["dialogue_state"]["payment_options_mentioned"] is True
         return completion("Какой бюджет вы рассматриваете?")
 
-    asyncio.run(process(settings, handler))
+    asyncio.run(suggest(settings, handler))
 
 
 def test_characteristics_and_retraction_flow_through_processing(settings: Settings) -> None:
     ingest_event(settings, event("first", "угловой диван"))
-    asyncio.run(process(settings, lambda request: completion(furniture_type="угловой диван")))
+    asyncio.run(suggest(settings, lambda request: completion(furniture_type="угловой диван")))
     with open_database(settings.database_path, timeout=1) as connection, connection:
         save_lead(connection, 1, Lead(phone="old"))
     ingest_event(settings, event("second", "для ежедневного сна. Не используйте старый номер"))
@@ -629,7 +502,7 @@ def test_characteristics_and_retraction_flow_through_processing(settings: Settin
             phone={"clear": "Не используйте старый номер"},
         )
 
-    asyncio.run(process(settings, handler))
+    asyncio.run(suggest(settings, handler))
     lead = rows(settings, "leads")[0]
     assert lead["furniture_type"] == "угловой диван; для ежедневного сна"
     assert lead["phone"] is None
@@ -644,15 +517,14 @@ def test_stale_retraction_cannot_clear_a_lead(settings: Settings) -> None:
         ingest_event(settings, event("newer", "Оставьте прежний номер"))
         return completion("Хорошо.", phone={"clear": "Не используйте старый номер"})
 
-    asyncio.run(process(settings, handler))
+    with pytest.raises(APIError, match="consultation_superseded"):
+        asyncio.run(suggest(settings, handler))
     assert rows(settings, "leads")[0]["phone"] == "old"
-    assert not rows(settings, "suggestions")
 
 
 def test_overlong_model_reply_is_not_saved_or_sent(settings: Settings) -> None:
     ingest_event(settings, event())
     with pytest.raises(APIError, match="invalid_consultation_response"):
-        asyncio.run(process(settings, lambda request: completion("я" * 451, name="Анна")))
+        asyncio.run(suggest(settings, lambda request: completion("я" * 451, name="Анна")))
     assert not rows(settings, "leads")
-    assert not rows(settings, "suggestions")
     assert not rows(settings, "outgoing_attempts")

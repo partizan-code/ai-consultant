@@ -149,7 +149,7 @@ def test_webhook_logs_results_without_secrets_or_payload(
         logger.remove(sink)
     output = "\n".join(logs)
     assert "сохранено" in output
-    assert "в очередь" in output
+    assert "в очередь" not in output
     assert "повторная доставка" in output
     assert "пропущено" in output
     assert "WARNING" in output and "ERROR" in output
@@ -234,7 +234,7 @@ def test_history_send_and_outgoing_webhook_through_admin_api(tmp_path: Path) -> 
     asyncio.run(run())
     assert len(calls) == 3
     with open_database(settings.database_path, timeout=1) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
         assert (
             connection.execute("SELECT COUNT(*) FROM messages WHERE imported = 1").fetchone()[0]
             == 1
@@ -320,13 +320,10 @@ def test_worker_lifecycle_and_authenticated_knowledge_reload(tmp_path: Path) -> 
                 assert (await client.post(url, headers=headers)).status_code == 409
                 assert len(app.state.knowledge.documents) == 1
                 await client.post("/webhooks/umnico/synthetic-hook", json=incoming())
+                await client.post("/admin/chats/1/suggestion", headers=headers)
                 await asyncio.wait_for(completed.wait(), timeout=2)
                 with open_database(settings.database_path, timeout=1) as connection:
-                    assert connection.execute("SELECT status FROM jobs").fetchone()[0] == "done"
-                    assert (
-                        connection.execute("SELECT text FROM suggestions").fetchone()[0]
-                        == "Обивка велюр."
-                    )
+                    assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
         assert app.state.openrouter._http.is_closed and app.state.umnico._http.is_closed
 
     asyncio.run(run())

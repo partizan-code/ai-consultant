@@ -57,12 +57,6 @@ CREATE TABLE IF NOT EXISTS leads (
     purchase_time TEXT,
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
-CREATE TABLE IF NOT EXISTS suggestions (
-    conversation_id INTEGER PRIMARY KEY REFERENCES chats(id),
-    message_id INTEGER NOT NULL REFERENCES messages(id),
-    text TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY,
     message_id INTEGER NOT NULL UNIQUE REFERENCES messages(id),
@@ -345,7 +339,10 @@ def store_event(
         )
         if not own_receipt:
             invalidate_conversation(connection, chat_id)
-        if event.direction == "incoming" and event.text.strip():
+        paused = connection.execute("SELECT paused FROM chats WHERE id = ?", (chat_id,)).fetchone()[
+            0
+        ]
+        if event.direction == "incoming" and event.text.strip() and not paused:
             connection.execute("INSERT INTO jobs(message_id) VALUES (?)", (message_id,))
         elif event.direction == "outgoing" and not own_receipt:
             for member_id in conversation_chat_ids(connection, chat_id):
@@ -382,7 +379,6 @@ def reconcile_outgoing_attempt(connection: sqlite3.Connection, request_id: str) 
         (request_id,),
     ).fetchone()
     if confirmed:
-        clear_answered_suggestion(connection, request_id)
         connection.execute(
             "UPDATE jobs SET status = 'done' WHERE 'consultation:' || id = ? "
             "AND status IN ('processing', 'unknown')",
@@ -423,7 +419,7 @@ def claim_next_job(connection: sqlite3.Connection) -> sqlite3.Row | None:
     row = connection.execute(
         "SELECT j.id, j.message_id, j.generation, m.chat_id FROM jobs j "
         "JOIN messages m ON m.id = j.message_id JOIN chats c ON c.id = m.chat_id "
-        "WHERE j.status = 'pending' "
+        "WHERE j.status = 'pending' AND c.paused = 0 "
         "AND NOT EXISTS (SELECT 1 FROM jobs active JOIN messages am "
         "ON am.id = active.message_id JOIN chats ac ON ac.id = am.chat_id "
         "WHERE ac.account_id = c.account_id AND ac.lead_id = c.lead_id "
@@ -568,7 +564,6 @@ def save_consultation(
     connection: sqlite3.Connection,
     job: sqlite3.Row,
     lead: Lead,
-    reply: str,
     *,
     cleared_fields: tuple[str, ...] = (),
 ) -> bool | None:
@@ -584,13 +579,6 @@ def save_consultation(
             f"SELECT MAX(paused) FROM chats WHERE id IN ({placeholders})", member_ids
         ).fetchone()[0]
     )
-    if paused:
-        connection.execute(
-            "INSERT INTO suggestions(conversation_id, message_id, text) VALUES (?, ?, ?) "
-            "ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, "
-            "text = excluded.text, created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-            (member_ids[0], job["message_id"], reply),
-        )
     return paused
 
 
@@ -644,55 +632,3 @@ def invalidate_conversation(connection: sqlite3.Connection, chat_id: int) -> Non
     member_ids = conversation_chat_ids(connection, chat_id)
     for member_id in member_ids:
         cancel_generation(connection, member_id)
-    connection.execute("DELETE FROM suggestions WHERE conversation_id = ?", (member_ids[0],))
-
-
-def queue_unanswered_message(connection: sqlite3.Connection, chat_id: int) -> None:
-    """Called only on a transition to pause, after invalidating the old generation."""
-    member_ids = conversation_chat_ids(connection, chat_id)
-    placeholders = ",".join("?" for _ in member_ids)
-    latest = connection.execute(
-        f"SELECT * FROM messages WHERE chat_id IN ({placeholders}) AND imported = 0 "
-        "AND direction = 'incoming' "
-        "ORDER BY id DESC LIMIT 1",
-        member_ids,
-    ).fetchone()
-    if latest is None or not latest["text"].strip():
-        return
-    if connection.execute(
-        f"SELECT 1 FROM messages m WHERE chat_id IN ({placeholders}) AND imported = 0 "
-        "AND direction = 'outgoing' AND id > ? AND NOT EXISTS ("
-        "SELECT 1 FROM outgoing_receipts r JOIN outgoing_attempts a "
-        "ON a.request_id = r.custom_id WHERE r.message_id = m.id "
-        "AND a.chat_id = m.chat_id AND a.text = m.text)",
-        (*member_ids, latest["id"]),
-    ).fetchone():
-        return
-    answered = connection.execute(
-        f"SELECT 1 FROM outgoing_attempts WHERE chat_id IN ({placeholders}) "
-        "AND status IN ('sent', 'unknown') AND (message_id >= ? OR "
-        "(message_id IS NULL AND julianday(created_at) >= julianday(?)))",
-        (*member_ids, latest["id"], latest["created_at"]),
-    ).fetchone()
-    if answered:
-        return
-    connection.execute(
-        "INSERT INTO jobs(message_id) VALUES (?) ON CONFLICT(message_id) DO UPDATE SET "
-        "status = 'pending', generation = jobs.generation + 1 "
-        "WHERE NOT EXISTS (SELECT 1 FROM outgoing_attempts a "
-        "WHERE a.request_id = 'consultation:' || jobs.id AND a.status IN ('sent', 'unknown'))",
-        (latest["id"],),
-    )
-
-
-def clear_answered_suggestion(connection: sqlite3.Connection, request_id: str) -> None:
-    attempt = connection.execute(
-        "SELECT chat_id, message_id FROM outgoing_attempts WHERE request_id = ?",
-        (request_id,),
-    ).fetchone()
-    if attempt:
-        root = conversation_chat_ids(connection, attempt["chat_id"])[0]
-        connection.execute(
-            "DELETE FROM suggestions WHERE conversation_id = ? AND message_id <= ?",
-            (root, attempt["message_id"]),
-        )

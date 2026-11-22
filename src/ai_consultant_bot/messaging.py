@@ -12,7 +12,6 @@ from ai_consultant_bot.config import Settings
 from ai_consultant_bot.events import parse_event, parse_history_message
 from ai_consultant_bot.storage import (
     cancel_generation,
-    clear_answered_suggestion,
     consultation_is_current,
     conversation_chat_ids,
     open_database,
@@ -65,8 +64,6 @@ def ingest_event(settings: Settings, payload: Any) -> str:
     direction = "входящее" if event.direction == "incoming" else "исходящее"
     source = "Direct" if event.chat.source_type == "message" else "комментарий"
     logger.info("Webhook: {} сообщение ({}) сохранено.", direction, source)
-    if event.direction == "incoming" and event.text.strip():
-        logger.info("Задание добавлено в очередь, ожидает обработки.")
     return "saved"
 
 
@@ -353,8 +350,6 @@ async def send_text(
                         "SELECT * FROM outgoing_attempts WHERE request_id = ?", (request_id,)
                     ).fetchone()
                 )
-                if result["status"] == "sent":
-                    clear_answered_suggestion(connection, request_id)
                 record_api_call(
                     connection,
                     "send_text",

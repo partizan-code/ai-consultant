@@ -21,7 +21,8 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     state = SimpleNamespace(
         settings={"model": "chosen/model"},
         paused=True,
-        suggestion={"conversation_id": 1, "message_id": 1, "text": "Ответ"},
+        suggestion_text="Ответ",
+        suggestion_failure=False,
         attempts=[],
         calls=[],
         comment=False,
@@ -83,22 +84,21 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
                 },
                 "messages": state.messages,
                 "message_total": len(state.messages),
-                "suggestion": state.suggestion,
                 "attempts": state.attempts,
                 "reply_block_reason": "comment_private_reply_unverified" if state.comment else None,
                 "reply_chat_id": state.reply_chat_id,
             }
         if path == "chats/1/pause":
             state.paused = payload["paused"]
-            if not state.paused:
-                state.suggestion = None
             return payload
         if path == "chats/1/import-history":
             return {"imported": 0}
+        if path.endswith("/suggestion"):
+            if state.suggestion_failure:
+                raise PanelError("Не удалось получить подсказку")
+            return {"text": state.suggestion_text}
         if path.endswith("/send-text"):
             state.paused = True
-            if state.outcome == "sent":
-                state.suggestion = None
             state.attempts.append(
                 {
                     **payload,
@@ -141,7 +141,7 @@ def test_pinned_test_chat_is_available_without_customer_chats(backend: SimpleNam
     assert len(app.text_area) == 1
     assert not app.toggle
     assert not any(
-        item.label in ("Отправить ответ", "Импортировать историю") for item in app.button
+        item.label in ("Использовать подсказку", "Импортировать историю") for item in app.button
     )
     assert all(method == "GET" for method, _, _ in backend.calls)
 
@@ -294,12 +294,14 @@ def test_panel_worker_status_uses_backend_reason(
         assert not any("обработк" in item.value.lower() for item in app.info)
 
 
-def test_panel_activation_keeps_editor_and_removes_suggestion(backend: SimpleNamespace) -> None:
+def test_panel_activation_keeps_editor_and_hides_suggestion_button(
+    backend: SimpleNamespace,
+) -> None:
     app = panel()
     assert not app.toggle(key="bot_active_1").value
     app.text_area[0].set_value("Мои правки")
     app.toggle(key="bot_active_1").set_value(True).run()
-    assert not backend.paused and backend.suggestion is None
+    assert not backend.paused
     assert app.text_area[0].value == "Мои правки"
     assert not any(item.label == "Использовать подсказку" for item in app.button)
     assert [payload for method, path, payload in backend.calls if path == "chats/1/pause"] == [
@@ -311,8 +313,8 @@ def test_panel_activation_keeps_editor_and_removes_suggestion(backend: SimpleNam
 def test_panel_manual_reply_and_refresh_do_not_resend(backend: SimpleNamespace) -> None:
     app = panel()
     app.text_area[0].set_value("Здравствуйте")
-    button(app, "Отправить ответ").click().run()
-    assert backend.paused and backend.suggestion is None
+    button(app, "Отправить сообщение").click().run()
+    assert backend.paused
     assert not app.toggle(key="bot_active_1").value
     assert len(backend.attempts) == 1
     app.run()
@@ -324,8 +326,8 @@ def test_panel_unknown_disables_new_manual_send(backend: SimpleNamespace) -> Non
     backend.outcome = "unknown"
     app = panel()
     app.text_area[0].set_value("Здравствуйте")
-    button(app, "Отправить ответ").click().run()
-    assert button(app, "Отправить ответ").disabled
+    button(app, "Отправить сообщение").click().run()
+    assert button(app, "Отправить сообщение").disabled
     app.run()
     assert len(backend.attempts) == 1 and not app.exception
 
@@ -342,7 +344,7 @@ def test_send_refreshes_history_immediately_and_restarts_history_timer(
     backend.calls.clear()
     timer.active = True
     timer.only = -1
-    button(app, "Отправить ответ").click().run()
+    button(app, "Отправить сообщение").click().run()
     assert not app.exception
     assert [message.text[0].value for message in app.chat_message] == ["Ответ без ожидания webhook"]
     assert app.text_area[0].value == ""
@@ -413,7 +415,7 @@ def test_history_has_no_page_selector_and_keeps_latest_messages_after_send(
     assert not app.number_input
     assert app.chat_message[0].text[0].value == "Сообщение 1"
     app.text_area[0].set_value("Новый ответ")
-    button(app, "Отправить ответ").click().run()
+    button(app, "Отправить сообщение").click().run()
     assert not app.exception and not app.number_input
     assert [message.text[0].value for message in app.chat_message] == [
         "Сообщение 1",
@@ -425,7 +427,7 @@ def test_history_has_no_page_selector_and_keeps_latest_messages_after_send(
 def test_panel_comment_and_backend_error(backend: SimpleNamespace) -> None:
     backend.comment = True
     app = panel()
-    assert button(app, "Отправить ответ").disabled
+    assert button(app, "Отправить сообщение").disabled
     backend.failure = True
     app.run()
     assert app.error[0].value == "Синтетический backend недоступен" and not app.exception
@@ -673,7 +675,6 @@ def test_timer_updates_chat_without_redrawing_form_or_sending(
         ("GET", "chats/2", None),
         ("GET", "chats/2", None),
         ("GET", "chats/2", None),
-        ("GET", "chats/2", None),
     ]
     assert app.session_state["selected_chat_id"] == 2
     # A subsequent full rerun still has the same text and selected chat.
@@ -885,9 +886,9 @@ def test_grouped_chat_uses_direct_route_for_suggestion(
     backend.chats[0]["source_types"] = "comment,message"
     app = panel()
     assert not app.exception and not button(app, "Использовать подсказку").disabled
-    assert not button(app, "Отправить ответ").disabled
+    assert not button(app, "Отправить сообщение").disabled
     app.text_area[0].set_value("Ответ в существующий Direct")
-    button(app, "Отправить ответ").click().run()
+    button(app, "Отправить сообщение").click().run()
     assert not app.exception
     sends = [path for method, path, _ in backend.calls if method == "POST"]
     assert sends == ["chats/2/send-text"]
@@ -955,12 +956,12 @@ def test_timer_updates_manual_send_availability_without_redrawing_input(
     app = panel()
     app.session_state["manual_text_1_0"] = "Набираемый ответ"
     app.run()
-    assert button(app, "Отправить ответ").disabled
+    assert button(app, "Отправить сообщение").disabled
     backend.comment = False
     backend.reply_chat_id = 2
     timer.active = True
     app.run()
-    assert not app.exception and not button(app, "Отправить ответ").disabled
+    assert not app.exception and not button(app, "Отправить сообщение").disabled
     assert app.session_state["manual_text_1_0"] == "Набираемый ответ"
     backend.attempts.append(
         {
@@ -973,15 +974,15 @@ def test_timer_updates_manual_send_availability_without_redrawing_input(
         }
     )
     app.run()
-    assert not app.exception and button(app, "Отправить ответ").disabled
+    assert not app.exception and button(app, "Отправить сообщение").disabled
     backend.attempts[0]["status"] = "sent"
     backend.attempts[0]["confirmed"] = True
     app.run()
-    assert not app.exception and not button(app, "Отправить ответ").disabled
+    assert not app.exception and not button(app, "Отправить сообщение").disabled
     assert app.session_state["manual_text_1_0"] == "Набираемый ответ"
     # Exercise a real form submission rerun scoped to the controls fragment.
     timer.only = -1
-    button(app, "Отправить ответ").click().run()
+    button(app, "Отправить сообщение").click().run()
     assert not app.exception
     assert [path for method, path, _ in backend.calls if method == "POST"] == ["chats/2/send-text"]
 
@@ -994,7 +995,7 @@ def test_timer_recovers_lost_send_response_without_resending(
     app.text_area[0].set_value("Здравствуйте")
     timer.active = True
     timer.only = -1
-    button(app, "Отправить ответ").click().run()
+    button(app, "Отправить сообщение").click().run()
     assert not app.exception and app.error
     assert len(backend.attempts) == 1
     backend.calls.clear()
@@ -1010,7 +1011,7 @@ def test_timer_recovers_lost_send_response_without_resending(
     assert all(method == "GET" for method, _, _ in backend.calls)
     # The recovered original text must not become a fresh request on a second click.
     app.session_state["manual_text_1_0"] = "Здравствуйте"
-    button(app, "Отправить ответ").click().run()
+    button(app, "Отправить сообщение").click().run()
     assert not app.exception and len(backend.attempts) == 1
     assert app.text_area[0].value == ""
     assert all(method == "GET" for method, _, _ in backend.calls)
@@ -1071,25 +1072,33 @@ def test_timer_clamps_chat_page_when_list_shrinks(
     assert "selected_chat_id" not in app.session_state
 
 
-def test_use_suggestion_and_confirm_replacement(backend: SimpleNamespace) -> None:
+def test_suggestion_generated_only_on_click_and_replaces_editor(backend: SimpleNamespace) -> None:
     app = panel()
+    assert not any("Подсказка ИИ" == item.value for item in app.caption)
+    assert not any(path.endswith("/suggestion") for _, path, _ in backend.calls)
     button(app, "Использовать подсказку").click().run()
     assert not app.exception and app.text_area[0].value == "Ответ"
     app.text_area[0].set_value("Мои правки")
-    backend.suggestion = {"text": "Новая подсказка", "message_id": 2}
+    backend.suggestion_text = "Новая подсказка"
+    button(app, "Использовать подсказку").click().run()
+    assert not app.exception and app.text_area[0].value == "Новая подсказка"
+    assert not app.warning
+    assert len([path for _, path, _ in backend.calls if path.endswith("/suggestion")]) == 2
+    assert not backend.attempts
+    assert not any(item.value == "Новая подсказка" for item in app.text)
+    app.text_area[0].set_value("Редактированный ответ")
+    button(app, "Отправить сообщение").click().run()
+    assert backend.attempts[0]["text"] == "Редактированный ответ"
+    assert app.text_area[0].value == ""
+
+
+def test_suggestion_error_preserves_editor(backend: SimpleNamespace) -> None:
+    app = panel()
+    backend.suggestion_failure = True
+    app.text_area[0].set_value("Мои правки")
     button(app, "Использовать подсказку").click().run()
     assert not app.exception and app.text_area[0].value == "Мои правки"
-    assert any("Заменить" in item.value for item in app.warning)
-    button(app, "Отмена").click().run()
-    assert app.text_area[0].value == "Мои правки"
-    button(app, "Использовать подсказку").click().run()
-    button(app, "Подтвердить замену").click().run()
-    assert not app.exception and app.text_area[0].value == "Новая подсказка"
-    assert not backend.attempts
-    app.text_area[0].set_value("Редактированный ответ")
-    button(app, "Отправить ответ").click().run()
-    assert backend.attempts[0]["text"] == "Редактированный ответ"
-    assert app.text_area[0].value == "" and backend.suggestion is None
+    assert app.error and not backend.attempts
 
 
 @pytest.mark.parametrize("outcome", ["failed", "blocked", "unknown"])
@@ -1097,15 +1106,14 @@ def test_unsuccessful_send_preserves_editor(backend: SimpleNamespace, outcome: s
     backend.outcome = outcome
     app = panel()
     app.text_area[0].set_value("Сохранить этот текст")
-    button(app, "Отправить ответ").click().run()
+    button(app, "Отправить сообщение").click().run()
     app.run()
     assert not app.exception and app.text_area[0].value == "Сохранить этот текст"
-    assert backend.suggestion is not None
     assert not app.chat_message
     assert "chat_refresh_revision" not in app.session_state
 
 
-def test_suggestion_timer_preserves_edits_and_response_inside_window(
+def test_timer_preserves_editor_without_generating_suggestion(
     backend: SimpleNamespace, timer: SimpleNamespace
 ) -> None:
     app = panel()
@@ -1114,14 +1122,15 @@ def test_suggestion_timer_preserves_edits_and_response_inside_window(
     assert history.proto.height_config.pixel_height == 420
     assert not history.text_area and not history.button
     assert len(window.text_area) == 1
-    assert any(item.label == "Отправить ответ" for item in window.button)
+    assert any(item.label == "Отправить сообщение" for item in window.button)
     assert any(item.label == "Использовать подсказку" for item in window.button)
     app.session_state["manual_text_1_0"] = "Набираемый ответ"
     app.run()
-    backend.suggestion = {"text": "Новая подсказка", "message_id": 2}
+    backend.suggestion_text = "Новая подсказка"
     timer.active = True
     app.run()
     assert not app.exception
-    assert any(item.value == "Новая подсказка" for item in app.text)
+    assert not any(item.value == "Новая подсказка" for item in app.text)
+    assert not any(path.endswith("/suggestion") for _, path, _ in backend.calls)
     assert app.session_state["manual_text_1_0"] == "Набираемый ответ"
     assert not backend.attempts

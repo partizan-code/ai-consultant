@@ -25,9 +25,12 @@ def admin_request(
         raise PanelError("Задайте ADMIN_TOKEN и перезапустите backend и панель.")
     # Never send the admin token to the tunnel or a configurable remote hostname.
     url = f"http://127.0.0.1:{settings.server_port}/admin/{path}"
+    timeout = settings.panel_request_timeout
+    if path.endswith("/suggestion"):
+        timeout = max(timeout, settings.openrouter_read_timeout + settings.database_timeout)
     try:
         with httpx.Client(
-            timeout=httpx.Timeout(settings.panel_request_timeout, connect=settings.connect_timeout),
+            timeout=httpx.Timeout(timeout, connect=settings.connect_timeout),
             follow_redirects=False,
             trust_env=False,
             transport=transport,
@@ -39,6 +42,8 @@ def admin_request(
                 json=payload,
             )
     except httpx.HTTPError:
+        if path.endswith("/suggestion"):
+            raise PanelError("Не удалось получить подсказку. Текст в редакторе сохранён.") from None
         if path == "test-chat/reply":
             raise PanelError(
                 "Не удалось дождаться тестового ответа. Диалог не изменён; "
@@ -57,6 +62,11 @@ def admin_request(
             503: "Backend не готов: проверьте ADMIN_TOKEN и доступность SQLite.",
         }
         if response.status_code == 409:
+            if path.endswith("/suggestion"):
+                messages[409] = (
+                    "Не удалось получить подсказку. Проверьте состояние переписки "
+                    "и доступ к модели. Текст в редакторе сохранён."
+                )
             if path == "test-chat/reply":
                 messages[409] = (
                     "Модель не вернула тестовый ответ. Проверьте ключ и доступ к OpenRouter."

@@ -13,17 +13,11 @@ from ai_consultant_bot.storage import SCHEMA, initialize_database, open_database
 def legacy_database(path: Path, enabled: str) -> None:
     schema = SCHEMA.replace("    generation INTEGER NOT NULL DEFAULT 0,\n", "")
     schema = schema.replace("    message_id INTEGER REFERENCES messages(id),\n", "")
-    start = schema.index("CREATE TABLE IF NOT EXISTS suggestions")
-    end = schema.index(";", start) + 1
-    schema = (
-        schema[:start]
-        + """
+    schema += """
 CREATE TABLE drafts (
     id INTEGER PRIMARY KEY, chat_id INTEGER REFERENCES chats(id),
     message_id INTEGER REFERENCES messages(id), text TEXT, status TEXT DEFAULT 'pending'
 );"""
-        + schema[end:]
-    )
     with sqlite3.connect(path) as connection:
         connection.executescript(schema)
         connection.executemany(
@@ -82,7 +76,9 @@ def test_migration_removes_legacy_and_preserves_business_data(tmp_path: Path, en
             after = [dict(row) for row in connection.execute(f"SELECT * FROM {name}")]
             assert [{key: row[key] for key in rows[0]} for row in after] == rows
         assert connection.execute("SELECT message_id FROM outgoing_attempts").fetchone()[0] == 1
-        assert not connection.execute("SELECT * FROM suggestions").fetchall()
+        assert not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'suggestions'"
+        ).fetchone()
         assert connection.execute("PRAGMA foreign_key_check").fetchone() is None
 
 

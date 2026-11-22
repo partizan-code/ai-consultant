@@ -12,7 +12,6 @@ from ai_consultant_bot.storage import (
     get_setting,
     invalidate_conversation,
     open_database,
-    queue_unanswered_message,
     set_setting,
 )
 
@@ -109,9 +108,6 @@ def chat_detail(settings: Settings, chat_id: int, offset: int = 0) -> dict[str, 
             "ORDER BY julianday(m.occurred_at) DESC, m.id DESC LIMIT ? OFFSET ?",
             (*member_ids, settings.panel_page_size, offset),
         ).fetchall()
-        suggestion = connection.execute(
-            "SELECT * FROM suggestions WHERE conversation_id = ?", (member_ids[0],)
-        ).fetchone()
         attempts = connection.execute(
             "SELECT a.*, EXISTS (SELECT 1 FROM outgoing_receipts r JOIN messages m "
             "ON m.id = r.message_id WHERE r.custom_id = a.request_id "
@@ -128,7 +124,6 @@ def chat_detail(settings: Settings, chat_id: int, offset: int = 0) -> dict[str, 
             "message_total": connection.execute(
                 f"SELECT COUNT(*) FROM messages WHERE chat_id IN ({placeholders})", member_ids
             ).fetchone()[0],
-            "suggestion": dict(suggestion) if suggestion else None,
             "attempts": [dict(row) for row in attempts],
             "reply_block_reason": reply_block_reason,
         }
@@ -152,8 +147,6 @@ def set_pause(settings: Settings, chat_id: int, paused: bool) -> dict[str, bool]
                 connection.execute(
                     "UPDATE chats SET paused = ? WHERE id = ?", (int(paused), member_id)
                 )
-            if paused:
-                queue_unanswered_message(connection, chat_id)
     return {"paused": paused}
 
 

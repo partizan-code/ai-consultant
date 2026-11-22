@@ -32,9 +32,16 @@ STATUS_LABELS = {
     "blocked": "Отправка заблокирована",
 }
 CHAT_SCROLL_SCRIPT = Path(__file__).with_name("chat_scroll.js").read_text(encoding="utf-8")
+CHAT_KEYBOARD_SCRIPT = Path(__file__).with_name("chat_keyboard.js").read_text(encoding="utf-8")
 PANEL_STYLES = """
 <style>
     .st-key-chat_scroll_init { display: none; }
+    .st-key-reply_composer [data-testid="InputInstructions"] > span:first-child:not(:only-child) {
+        display: none;
+    }
+    .st-key-reply_composer [data-testid="InputInstructions"] > span:nth-child(2)::before {
+        display: none;
+    }
     /* Keep content below Streamlit's fixed toolbar. */
     .block-container { padding-top: 4rem; }
     .block-container :is(h1, h2, h3, h4, h5, h6) {
@@ -136,10 +143,6 @@ PANEL_STYLES = """
         .st-key-reply_composer textarea {
             resize: none;
         }
-        .st-key-suggestion_preview {
-            max-height: min(18dvh, 8rem);
-            overflow-y: auto;
-        }
         .st-key-chat_layout [data-testid="stColumn"] > [data-testid="stVerticalBlock"],
         .st-key-chat_layout :is(
             [data-testid="stLayoutWrapper"], [data-testid="stVerticalBlock"]
@@ -170,13 +173,6 @@ PANEL_STYLES = """
         box-sizing: border-box;
         width: 100%;
         max-width: 100%;
-    }
-    .st-key-suggestion_preview [data-testid="stText"] {
-        font-size: 0.875rem;
-        line-height: 1.45;
-    }
-    .st-key-suggestion_preview [data-testid="stText"] > span {
-        color: #52bf7c;
     }
     .st-key-chat_thread [data-testid="stVerticalBlock"] { gap: 0.25rem; }
     .st-key-chat_thread [data-testid="stChatMessage"] {
@@ -390,50 +386,7 @@ def show_messages(settings: Settings, chat_id: int, detail: dict) -> None:
         # Only integer view IDs enter this script; message content stays in st.text.
         revision = st.session_state.get("chat_scroll_revision", 0)
         script = CHAT_SCROLL_SCRIPT.replace("__CHAT_VIEW__", f"{chat_id}:0:{revision}")
-        st.html(f"<script>{script}</script>", unsafe_allow_javascript=True)
-
-
-def use_suggestion(chat_id: int, revision: int, text: str) -> None:
-    st.session_state[f"manual_revision_{chat_id}"] = revision + 1
-    st.session_state[f"manual_text_{chat_id}_{revision + 1}"] = text
-    st.session_state.pop(f"suggestion_replace_{chat_id}", None)
-    st.rerun()
-
-
-def show_suggestion(settings: Settings, chat_id: int) -> None:
-    try:
-        detail = admin_request(settings, "GET", f"chats/{chat_id}")
-    except PanelError as error:
-        st.error(str(error))
-        return
-    suggestion = detail["suggestion"] if detail["chat"]["paused"] else None
-    if suggestion:
-        with st.container(key="suggestion_preview", gap="xxsmall"):
-            st.caption("Подсказка ИИ")
-            st.text(suggestion["text"])
-
-
-def confirm_suggestion(
-    chat_id: int, revision: int, suggestion: dict | None, selected: bool
-) -> None:
-    confirm_key = f"suggestion_replace_{chat_id}"
-    if not suggestion:
-        st.session_state.pop(confirm_key, None)
-        return
-    if selected:
-        if st.session_state.get(f"manual_text_{chat_id}_{revision}", ""):
-            st.session_state[confirm_key] = suggestion["text"]
-        else:
-            use_suggestion(chat_id, revision, suggestion["text"])
-    if confirm_key in st.session_state:
-        st.warning("Заменить набранный текст подсказкой?")
-        if st.session_state[confirm_key] != suggestion["text"]:
-            st.text(st.session_state[confirm_key])
-        if st.button("Подтвердить замену"):
-            use_suggestion(chat_id, revision, st.session_state[confirm_key])
-        if st.button("Отмена"):
-            del st.session_state[confirm_key]
-            st.rerun()
+        st.html(f"<script>{script}\n{CHAT_KEYBOARD_SCRIPT}</script>", unsafe_allow_javascript=True)
 
 
 def show_manual_reply(settings: Settings, chat_id: int) -> None:
@@ -451,7 +404,6 @@ def show_manual_reply(settings: Settings, chat_id: int) -> None:
             st.session_state[revision_key] = revision + 1
     revision = st.session_state.get(revision_key, 0)
     with st.container(key="reply_composer"):
-        st.fragment(run_every=settings.panel_refresh_interval)(show_suggestion)(settings, chat_id)
         st.text_area(
             "Текст ответа",
             label_visibility="collapsed",
@@ -459,7 +411,7 @@ def show_manual_reply(settings: Settings, chat_id: int) -> None:
             key=f"manual_text_{chat_id}_{revision}",
             placeholder=(
                 "Введите сообщение... Отправка поставит бота на паузу.\n"
-                "Подсказки появляются после нового сообщения клиента"
+                "Enter — отправить, Shift+Enter — новая строка."
             ),
         )
         # Refresh controls independently so typing is never overwritten by the timer.
@@ -473,15 +425,23 @@ def show_manual_updates(settings: Settings, chat_id: int, revision: int) -> None
         detail = admin_request(settings, "GET", f"chats/{chat_id}")
     except PanelError as error:
         st.error(str(error))
-        st.button("Отправить ответ", disabled=True)
+        with st.container(horizontal=True, horizontal_alignment="right"):
+            st.button("Отправить сообщение", disabled=True)
         return
     uncertain = any(a["status"] == "unknown" for a in detail["attempts"])
-    suggestion = detail["suggestion"] if detail["chat"]["paused"] else None
-    with st.container(horizontal=True, vertical_alignment="center", key=f"reply_actions_{chat_id}"):
-        history = st.button("Импортировать историю", key=f"history_{chat_id}")
-        selected = st.button("Использовать подсказку") if suggestion else False
+    with st.container(
+        horizontal=True,
+        horizontal_alignment="distribute",
+        vertical_alignment="center",
+        key=f"reply_actions_{chat_id}",
+    ):
+        with st.container(horizontal=True, width="content"):
+            history = st.button("Импортировать историю", key=f"history_{chat_id}")
+            selected = st.button("Использовать подсказку") if detail["chat"]["paused"] else False
         submit = st.button(
-            "Отправить ответ", disabled=bool(detail["reply_block_reason"]) or uncertain
+            "Отправить сообщение",
+            key=f"reply_send_{chat_id}",
+            disabled=bool(detail["reply_block_reason"]) or uncertain,
         )
     if history:
         route_id = detail.get("reply_chat_id") or chat_id
@@ -492,7 +452,16 @@ def show_manual_updates(settings: Settings, chat_id: int, revision: int) -> None
             )
         except PanelError as error:
             st.error(str(error))
-    confirm_suggestion(chat_id, revision, suggestion, selected)
+    if selected:
+        try:
+            with st.spinner("Генерация подсказки..."):
+                suggestion = admin_request(settings, "POST", f"chats/{chat_id}/suggestion")
+        except PanelError as error:
+            st.error(str(error))
+            return
+        st.session_state[f"manual_revision_{chat_id}"] = revision + 1
+        st.session_state[f"manual_text_{chat_id}_{revision + 1}"] = suggestion["text"]
+        st.rerun()
     revision_key = f"manual_revision_{chat_id}"
     pending_key = f"manual_attempt_{chat_id}"
     pending = st.session_state.get(pending_key)

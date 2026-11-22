@@ -69,7 +69,6 @@ def rows(settings: Settings, table: str) -> list[dict]:
         "chats",
         "jobs",
         "message_context",
-        "suggestions",
         "outgoing_attempts",
         "outgoing_receipts",
         "chat_profiles",
@@ -89,7 +88,7 @@ def test_routing_replay_and_ignored_lead_notifications(settings: Settings) -> No
     assert ingest_event(settings, {"type": "lead.changed", "lead": event["message"]}) == "ignored"
     assert ingest_event(settings, incoming("comment", "comment")) == "saved"
     assert len(rows(settings, "chats")) == 2
-    assert len(rows(settings, "jobs")) == 2
+    assert rows(settings, "jobs") == []
     assert rows(settings, "message_context")[1]["reply_block_reason"] == (
         "comment_private_reply_unverified"
     )
@@ -117,7 +116,8 @@ def test_photo_preview_is_retained_on_ingestion_history_and_replay(settings: Set
     ]
     event["message"]["preview"] = None
     assert ingest_event(settings, event) == "duplicate"
-    assert len(rows(settings, "messages")) == len(rows(settings, "jobs")) == 1
+    assert len(rows(settings, "messages")) == 1
+    assert rows(settings, "jobs") == []
     assert rows(settings, "message_previews")[0]["photo_url"].endswith("post.jpg")
     ingest_event(settings, incoming("direct"))
     old = history_message("old-photo")
@@ -140,7 +140,7 @@ def test_photo_preview_is_retained_on_ingestion_history_and_replay(settings: Set
             assert await import_history(settings, client, 2) == 0
 
     asyncio.run(run())
-    assert len(rows(settings, "jobs")) == 2  # Import/replay never queues an extra reply.
+    assert rows(settings, "jobs") == []  # Import/replay never queues an extra reply.
     assert rows(settings, "message_previews")[-1]["photo_url"].endswith("history.jpg")
 
 
@@ -210,7 +210,8 @@ def test_profile_enrichment_on_replay_preserves_route_and_latest_login(settings:
     replay["message"]["sender"]["login"] = "wrong_route"
     assert ingest_event(settings, replay) == "duplicate"
     assert rows(settings, "chat_profiles")[0]["instagram_username"] == "customer"
-    assert len(rows(settings, "jobs")) == len(rows(settings, "chats")) == 1
+    assert len(rows(settings, "chats")) == 1
+    assert rows(settings, "jobs") == []
 
     renamed = copy.deepcopy(event)
     renamed["message"]["messageId"] = "renamed"
@@ -248,21 +249,11 @@ def test_outgoing_and_empty_text_do_not_create_jobs(settings: Settings) -> None:
     assert rows(settings, "jobs") == []
 
 
-def test_incoming_removes_suggestion_and_jobs_are_serialized_on_pause(settings: Settings) -> None:
+def test_paused_incoming_does_not_queue_generation(settings: Settings) -> None:
     ingest_event(settings, incoming())
-    with open_database(settings.database_path, timeout=1) as connection, connection:
-        connection.execute(
-            "INSERT INTO suggestions(conversation_id, message_id, text) VALUES (1, 1, 'text')"
-        )
     ingest_event(settings, incoming("second"))
-    assert rows(settings, "suggestions") == []
+    assert rows(settings, "jobs") == []
     with open_database(settings.database_path, timeout=1) as connection, connection:
-        connection.execute("BEGIN IMMEDIATE")
-        assert claim_next_job(connection)["message_id"] == 2
-    with open_database(settings.database_path, timeout=1) as connection, connection:
-        connection.execute("BEGIN IMMEDIATE")
-        assert claim_next_job(connection) is None
-        connection.execute("UPDATE jobs SET status = 'done' WHERE id = 2")
         assert claim_next_job(connection) is None
 
 
@@ -296,7 +287,7 @@ def test_paginated_history_never_queues_replies_even_on_later_webhook(
     sequence = [{}, {"cursor": 1795171785523}, {"cursor": 1795171785522}]
     assert calls == sequence * 2
     assert ingest_event(settings, incoming("old-1")) == "duplicate"
-    assert len(rows(settings, "jobs")) == 1
+    assert rows(settings, "jobs") == []
     assert [row["imported"] for row in rows(settings, "messages")] == [0, 1, 1]
 
 
@@ -317,7 +308,8 @@ def test_empty_history_with_null_cursor_finishes_without_more_requests(
 
     asyncio.run(run())
     assert calls == [{}]
-    assert len(rows(settings, "messages")) == len(rows(settings, "jobs")) == 1
+    assert len(rows(settings, "messages")) == 1
+    assert rows(settings, "jobs") == []
 
 
 def test_history_backfills_login_from_existing_messages_without_new_jobs(
@@ -344,7 +336,7 @@ def test_history_backfills_login_from_existing_messages_without_new_jobs(
 
     asyncio.run(run())
     assert rows(settings, "chat_profiles")[0]["instagram_username"] == "customer_from_history"
-    assert len(rows(settings, "messages")) == 2 and len(rows(settings, "jobs")) == 1
+    assert len(rows(settings, "messages")) == 2 and not rows(settings, "jobs")
 
 
 def test_old_database_adds_profiles_without_changing_saved_data(settings: Settings) -> None:
@@ -357,7 +349,8 @@ def test_old_database_adds_profiles_without_changing_saved_data(settings: Settin
         initialize_database(connection, settings)
         assert connection.execute("SELECT name FROM leads").fetchone()[0] == "Анна"
         assert connection.execute("SELECT paused FROM chats").fetchone()[0] == 1
-    assert len(rows(settings, "messages")) == len(rows(settings, "jobs")) == 1
+    assert len(rows(settings, "messages")) == 1
+    assert rows(settings, "jobs") == []
     assert rows(settings, "chat_profiles") == []
 
 
@@ -391,7 +384,7 @@ def test_history_fails_explicitly_on_bad_pages(settings: Settings, case: str) ->
 
     asyncio.run(run())
     assert calls <= 2
-    assert len(rows(settings, "jobs")) == 1
+    assert rows(settings, "jobs") == []
 
 
 @pytest.mark.parametrize(
@@ -519,12 +512,12 @@ def test_client_verification_gates_precede_authentication() -> None:
     asyncio.run(run())
 
 
-def test_concurrent_webhook_delivery_creates_one_job(settings: Settings) -> None:
+def test_concurrent_paused_webhook_delivery_deduplicates_without_jobs(settings: Settings) -> None:
     with ThreadPoolExecutor(max_workers=4) as executor:
         results = list(executor.map(lambda _: ingest_event(settings, incoming()), range(8)))
     assert results.count("saved") == 1
     assert results.count("duplicate") == 7
-    assert len(rows(settings, "jobs")) == 1
+    assert rows(settings, "jobs") == []
 
 
 def test_concurrent_sends_are_serialized_and_id_conflicts_rejected(settings: Settings) -> None:
@@ -606,7 +599,7 @@ def test_history_validates_whole_page_before_writes(settings: Settings, missing_
 
     asyncio.run(run())
     assert len(rows(settings, "messages")) == 1
-    assert len(rows(settings, "jobs")) == 1
+    assert rows(settings, "jobs") == []
 
 
 def test_history_optional_source_fields_use_validated_route(settings: Settings) -> None:
@@ -632,7 +625,7 @@ def test_history_optional_source_fields_use_validated_route(settings: Settings) 
 
     asyncio.run(run())
     assert len(rows(settings, "chats")) == 1
-    assert len(rows(settings, "jobs")) == 1
+    assert rows(settings, "jobs") == []
     assert rows(settings, "message_context")[-1]["source_real_id"] == "255"
 
 
@@ -713,7 +706,7 @@ def test_late_webhook_resolves_unknown_and_enriches_duplicate(
 
     asyncio.run(run())
     assert calls == 1
-    assert len(rows(settings, "jobs")) == 1
+    assert rows(settings, "jobs") == []
     assert rows(settings, "outgoing_receipts")[0]["custom_id"] == "request-1"
 
 
@@ -830,5 +823,6 @@ def test_old_database_adds_receipts_without_changing_saved_data(settings: Settin
         connection.execute("DROP TABLE outgoing_receipts")  # Synthetic pre-upgrade schema only.
         initialize_database(connection, settings)
         initialize_database(connection, settings)
-    assert len(rows(settings, "messages")) == len(rows(settings, "jobs")) == 1
+    assert len(rows(settings, "messages")) == 1
+    assert rows(settings, "jobs") == []
     assert rows(settings, "outgoing_receipts") == []

@@ -54,7 +54,7 @@ def show_test_chat(
                 text = st.text_area(
                     "Сообщение тестового клиента",
                     label_visibility="collapsed",
-                    placeholder="Введите сообщение от лица клиента…",
+                    placeholder="Введите сообщение от лица клиента… Enter — отправить, Shift+Enter — новая строка.",
                     max_chars=settings.history_context_chars,
                     key=f"test_chat_text_{revision}",
                 )
@@ -63,8 +63,9 @@ def show_test_chat(
                     horizontal_alignment="distribute",
                     key="test_chat_actions",
                 ):
-                    # Keep send first so the form's keyboard shortcut still sends.
-                    submitted = st.form_submit_button("Отправить сообщение")
+                    submitted = st.form_submit_button(
+                        "Отправить сообщение", key=f"reply_send_test_{revision}"
+                    )
                     st.form_submit_button(
                         "Очистить чат", key="test_chat_reset", on_click=reset_test_chat
                     )

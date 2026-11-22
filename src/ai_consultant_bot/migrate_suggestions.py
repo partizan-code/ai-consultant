@@ -6,8 +6,6 @@ import argparse
 import sqlite3
 from pathlib import Path
 
-from ai_consultant_bot.storage import SCHEMA
-
 
 def migrate(connection: sqlite3.Connection) -> None:
     """Run with the backend stopped and a backup made; all changes are atomic."""
@@ -36,9 +34,6 @@ def migrate(connection: sqlite3.Connection) -> None:
                 "AND m.direction = 'incoming' AND m.imported = 0 "
                 "AND julianday(m.created_at) <= julianday(outgoing_attempts.created_at))"
             )
-        # Use the same table definition as new databases, without executescript's implicit commit.
-        statement = SCHEMA[SCHEMA.index("CREATE TABLE IF NOT EXISTS suggestions") :]
-        connection.execute(statement[: statement.index(";")])
         if connection.execute("PRAGMA foreign_key_check").fetchone():
             raise sqlite3.IntegrityError("Foreign key check failed; migration rolled back")
 
