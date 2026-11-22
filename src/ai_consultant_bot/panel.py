@@ -1,4 +1,4 @@
-"""Local single-administrator Streamlit views; all data goes through the backend."""
+"""Administrator views through the backend, including the pinned isolated test chat."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import streamlit as st
 from streamlit.delta_generator import DeltaGenerator
 
 from ai_consultant_bot.config import Settings, load_settings
+from ai_consultant_bot.model_sandbox_panel import TEST_CHAT_ID, show_test_chat
 from ai_consultant_bot.panel_client import PanelError, admin_request
 
 LEAD_LABELS = {
@@ -64,6 +65,7 @@ PANEL_STYLES = """
     }
     .st-key-chat_tabs button { text-align: left; justify-content: flex-start; }
     .st-key-chat_tabs [data-testid="stVerticalBlock"] { gap: 0.4rem; }
+    .st-key-test_chat_actions { flex-direction: row-reverse; }
     /* Streamlit inserts layout wrappers between keyed containers and columns. */
     .st-key-chat_layout [data-testid="stColumn"] {
         box-sizing: border-box;
@@ -86,7 +88,8 @@ PANEL_STYLES = """
             flex-direction: column;
             overflow: hidden;
         }
-        /* Carry the available height through Streamlit's layout and fragment wrappers. */
+        /* Carry the available height through Streamlit's layout and fragment wrappers.
+           The columns must also stretch before any conversation is selected. */
         .block-container :is(
             [data-testid="stLayoutWrapper"], [data-testid="stVerticalBlock"]
         ):has(.st-key-chat_layout),
@@ -94,7 +97,7 @@ PANEL_STYLES = """
         .st-key-chat_layout :is(
             [data-testid="stLayoutWrapper"], [data-testid="stVerticalBlock"],
             [data-testid="stHorizontalBlock"]
-        ):has(.st-key-conversation_window),
+        ):has([data-testid="stColumn"], .st-key-conversation_window),
         .st-key-conversation_window,
         .st-key-conversation_window :is(
             [data-testid="stLayoutWrapper"], [data-testid="stVerticalBlock"]
@@ -547,18 +550,30 @@ def show_chats(settings: Settings) -> None:
         st.fragment(run_every=settings.panel_refresh_interval)(show_chat_list)(settings)
     if chat_id := st.session_state.get("selected_chat_id"):
         with conversation:
-            show_chat(settings, chat_id, client_card)
+            if chat_id == TEST_CHAT_ID:
+                show_test_chat(settings, client_card, LEAD_LABELS, show_messages)
+            else:
+                show_chat(settings, chat_id, client_card)
 
 
 def show_chat_list(settings: Settings) -> None:
     # Register the timer before the first request, even with no chats or no backend.
     st.subheader("Чаты")
+    if st.button(
+        "Тестовый чат",
+        key="test_chat_tab",
+        type="primary" if st.session_state.get("selected_chat_id") == TEST_CHAT_ID else "secondary",
+        use_container_width=True,
+    ):
+        st.session_state["selected_chat_id"] = TEST_CHAT_ID
+        st.rerun()
     try:
         listing = admin_request(settings, "GET", "chats")
         if not listing["total"]:
-            if st.session_state.pop("selected_chat_id", None) is not None:
+            selected = st.session_state.get("selected_chat_id")
+            if selected not in (None, TEST_CHAT_ID):
+                st.session_state.pop("selected_chat_id", None)
                 st.rerun()
-            st.info("Чатов пока нет. Они появятся после первого webhook.")
             return
         offset = page_offset("Страница чатов", listing["total"], settings, "chats_page")
         if offset:
@@ -569,8 +584,9 @@ def show_chat_list(settings: Settings) -> None:
             return
         page_changed = st.session_state.get("chat_list_offset", offset) != offset
         st.session_state["chat_list_offset"] = offset
-        if st.session_state.get("selected_chat_id") is None or (
-            page_changed and st.session_state["selected_chat_id"] not in chats
+        if st.session_state.get("selected_chat_id") != TEST_CHAT_ID and (
+            st.session_state.get("selected_chat_id") is None
+            or (page_changed and st.session_state["selected_chat_id"] not in chats)
         ):
             st.session_state["selected_chat_id"] = next(iter(chats))
             st.rerun()
@@ -598,7 +614,13 @@ def chat_title(chat: dict) -> str:
 def show_status(settings: Settings) -> None:
     data = admin_request(settings, "GET", "status")
     if not data["worker_enabled"]:
-        st.warning("Ключ OpenRouter не задан; обработчик консультаций выключен.")
+        reason = data.get("worker_disabled_reason")
+        if reason == "staging":
+            st.info("Автоматическая обработка клиентских обращений отключена в режиме staging.")
+        elif reason == "missing_openrouter_key":
+            st.warning("Ключ OpenRouter не задан; обработчик консультаций выключен.")
+        else:
+            st.warning("Автоматическая обработка клиентских обращений отключена.")
     st.subheader("Последняя ошибка")
     if data["last_error"]:
         st.table([data["last_error"]])
@@ -656,6 +678,10 @@ def show_status_updates(settings: Settings) -> None:
 def render_panel(settings: Settings) -> None:
     st.set_page_config(page_title="Мебельный консультант", page_icon="💬", layout="wide")
     st.html(PANEL_STYLES)
+    if st.session_state.get("panel_section") == "Тест модели":
+        st.session_state["panel_section"] = "Чаты и заявки"
+        st.session_state["selected_chat_id"] = TEST_CHAT_ID
+        st.session_state.pop("model_test_dialogue", None)
     with st.container(key="panel_header"):
         st.title("Мебельный консультант")
         section = st.radio(

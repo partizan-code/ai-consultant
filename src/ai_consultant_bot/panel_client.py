@@ -39,6 +39,11 @@ def admin_request(
                 json=payload,
             )
     except httpx.HTTPError:
+        if path == "test-chat/reply":
+            raise PanelError(
+                "Не удалось дождаться тестового ответа. Диалог не изменён; "
+                "автоматического повтора запроса нет."
+            ) from None
         raise PanelError(
             "Backend недоступен или время ожидания истекло. Дождитесь автообновления: "
             "результат отправки мог сохраниться на сервере."
@@ -52,6 +57,10 @@ def admin_request(
             503: "Backend не готов: проверьте ADMIN_TOKEN и доступность SQLite.",
         }
         if response.status_code == 409:
+            if path == "test-chat/reply":
+                messages[409] = (
+                    "Модель не вернула тестовый ответ. Проверьте ключ и доступ к OpenRouter."
+                )
             if path == "knowledge/reload":
                 messages[409] = (
                     "Не удалось обновить базу знаний. Проверьте доступность файлов и кодировку "
@@ -81,6 +90,19 @@ def admin_request(
                     "Не удалось импортировать историю: Umnico вернул неожиданный формат ответа. "
                     "Диагностика типов полей записана в лог backend."
                 )
+            if path == "test-chat/reply" and isinstance(error, dict):
+                messages[409] = {
+                    "external_api_disabled": "В этом окружении тестовые запросы к модели отключены.",
+                    "invalid_consultation_response": (
+                        "Модель вернула ответ, не соответствующий формату консультации. "
+                        "Диалог не изменён."
+                    ),
+                    "missing_or_invalid_api_key": "Задайте корректный ключ OpenRouter для backend.",
+                }.get(error.get("error_code"), messages[409])
+        if response.status_code == 503 and path == "test-chat/reply":
+            messages[503] = (
+                "Тест модели недоступен: проверьте настройки backend и отдельный файл ключа."
+            )
         raise PanelError(messages.get(response.status_code, "Запрос backend не выполнен."))
     try:
         result = response.json()

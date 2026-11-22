@@ -173,4 +173,11 @@ def service_status(settings: Settings) -> dict[str, Any]:
             "last_error": dict(errors) if errors else None,
             "jobs": {row["status"]: row["count"] for row in jobs},
             "worker_enabled": bool(settings.openrouter_api_key) and settings.external_apis_enabled,
+            "worker_disabled_reason": (
+                "staging"
+                if not settings.external_apis_enabled
+                else "missing_openrouter_key"
+                if not settings.openrouter_api_key
+                else None
+            ),
         }

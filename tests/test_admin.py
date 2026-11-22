@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from ai_consultant_bot.admin import chat_detail, list_chats, set_pause
+from ai_consultant_bot.admin import chat_detail, list_chats, service_status, set_pause
 from ai_consultant_bot.config import Settings
 from ai_consultant_bot.knowledge import KnowledgeBase
 from ai_consultant_bot.messaging import ingest_event
@@ -41,6 +41,27 @@ def settings(tmp_path: Path) -> Settings:
     with open_database(settings.database_path, timeout=1) as connection:
         initialize_database(connection, settings)
     return settings
+
+
+@pytest.mark.parametrize("environment", ["local", "staging", "production"])
+@pytest.mark.parametrize("has_key", [False, True])
+def test_worker_status_reports_disable_reason(
+    settings: Settings, environment: str, has_key: bool
+) -> None:
+    settings = replace(
+        settings,
+        environment=environment,
+        public_base_url="https://example.org",
+        openrouter_api_key="synthetic-openrouter" if has_key else "",
+    )
+    status = service_status(settings)
+    assert status["worker_enabled"] == (environment != "staging" and has_key)
+    if environment == "staging":
+        assert status["worker_disabled_reason"] == "staging"
+    elif not has_key:
+        assert status["worker_disabled_reason"] == "missing_openrouter_key"
+    else:
+        assert status["worker_disabled_reason"] is None
 
 
 def event(message_id: str = "first", source: str = "message") -> dict:

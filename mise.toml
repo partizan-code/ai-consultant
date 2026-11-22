@@ -45,3 +45,7 @@ run = "uv run --no-sync ai-consultant-bot"
 [tasks.panel]
 description = "Start the local administrator panel"
 run = "uv run --no-sync ai-consultant-panel"
+
+[tasks.model-test]
+description = "Chat with OpenRouter using an isolated in-memory test dialogue"
+run = "uv run --no-sync python -m ai_consultant_bot.model_sandbox"

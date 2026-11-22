@@ -74,6 +74,7 @@ class Settings:
     panel_port: int = 8501
     panel_page_size: int = 50
     panel_request_timeout: float = 30.0
+    model_test_env_file: Path | None = None
     panel_refresh_interval: float = 10.0
     panel_history_refresh_interval: float = 3.0
     model_max_chars: int = 200
@@ -218,6 +219,8 @@ def load_settings(
             if not value:
                 raise ValueError(f"{name.upper()} must not be empty")
             kwargs[name] = Path(value)
+    if value := values.get("AI_CONSULTANT_MODEL_TEST_ENV_FILE", "").strip():
+        kwargs["model_test_env_file"] = Path(value)
     if "REGISTER_WEBHOOK" in values:
         value = values["REGISTER_WEBHOOK"].strip().lower()
         if value not in {"true", "false"}:

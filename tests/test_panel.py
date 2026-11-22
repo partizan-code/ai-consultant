@@ -130,6 +130,109 @@ def button(app: AppTest, label: str):
     return next(item for item in app.button if item.label == label)
 
 
+def test_pinned_test_chat_is_available_without_customer_chats(backend: SimpleNamespace) -> None:
+    backend.chats = []
+    app = panel()
+    assert app.button[0].label == "Тестовый чат"
+    assert "Тест модели" not in app.radio(key="panel_section").options
+    app.button(key="test_chat_tab").click().run()
+    assert not app.exception
+    assert app.session_state["selected_chat_id"] == "test"
+    assert len(app.text_area) == 1
+    assert not app.toggle
+    assert not any(
+        item.label in ("Отправить ответ", "Импортировать историю") for item in app.button
+    )
+    assert all(method == "GET" for method, _, _ in backend.calls)
+
+
+def test_test_chat_reset_clears_draft_history_lead_and_does_not_replay(
+    backend: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from copy import deepcopy
+
+    requests = []
+
+    def reply_request(settings, method, path, payload):
+        assert method == "POST" and path == "test-chat/reply"
+        assert settings.panel_request_timeout > settings.openrouter_read_timeout
+        requests.append(deepcopy(payload))
+        state = deepcopy(payload["state"])
+        state["history"] += [
+            {"direction": "incoming", "text": payload["text"]},
+            {"direction": "outgoing", "text": "Какой диван нужен?"},
+        ]
+        state["lead"]["city"] = payload["text"]
+        return {"reply": "Какой диван нужен?", "state": state, "model": "selected/model"}
+
+    monkeypatch.setattr("ai_consultant_bot.model_sandbox_panel.admin_request", reply_request)
+    app = panel()
+    app.button(key="test_chat_tab").click().run()
+    app.text_area[0].set_value("Минск")
+    button(app, "Отправить сообщение").click().run()
+    assert not app.exception and len(requests) == 1
+    assert app.session_state["test_chat_state"]["lead"]["city"] == "Минск"
+    assert len(app.chat_message) == 2 and app.text_area[0].value == ""
+    app.run()
+    assert len(requests) == 1
+    # Leaving the test chat and returning preserves its session data.
+    app.button(key="chat_tab_1").click().run()
+    app.button(key="test_chat_tab").click().run()
+    assert len(app.chat_message) == 2
+    app.text_area[0].set_value("Не отправлять").run()
+    app.button(key="test_chat_reset").click().run()
+    app.run()
+    assert not app.exception and not app.chat_message and app.text_area[0].value == ""
+    assert all(value is None for value in app.session_state["test_chat_state"]["lead"].values())
+    assert not app.session_state["test_chat_state"]["payment_options_mentioned"]
+    app.button(key="test_chat_reset").click().run()
+    assert len(requests) == 1
+    app.text_area[0].set_value("Гомель")
+    button(app, "Отправить сообщение").click().run()
+    assert not app.exception and len(requests) == 2
+    assert requests[1]["state"]["history"] == []
+    assert all(value is None for value in requests[1]["state"]["lead"].values())
+    assert app.session_state["test_chat_state"]["lead"]["city"] == "Гомель"
+    assert not backend.attempts
+    assert all(method == "GET" for method, _, _ in backend.calls)
+
+
+def test_test_chat_backend_failure_keeps_draft_and_dialogue(
+    backend: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failed_reply(*args, **kwargs):
+        raise PanelError("Тестовый ответ недоступен")
+
+    monkeypatch.setattr("ai_consultant_bot.model_sandbox_panel.admin_request", failed_reply)
+    app = panel()
+    app.button(key="test_chat_tab").click().run()
+    app.text_area[0].set_value("Минск")
+    button(app, "Отправить сообщение").click().run()
+    assert not app.exception and app.error[0].value == "Тестовый ответ недоступен"
+    assert app.text_area[0].value == "Минск" and not app.chat_message
+    assert app.session_state["test_chat_state"]["history"] == []
+
+
+def test_test_chat_is_present_in_production_and_old_section_migrates(
+    backend: SimpleNamespace,
+) -> None:
+    app = AppTest.from_string(
+        "from pathlib import Path\n"
+        "from ai_consultant_bot.panel import render_panel\n"
+        "from ai_consultant_bot.config import Settings\n"
+        "render_panel(Settings(environment='production', public_base_url='https://example.org', "
+        "database_path=Path.cwd() / 'unused.sqlite3', knowledge_base_path=Path.cwd() / 'unused-kb', "
+        "admin_token='synthetic-admin'))\n"
+    )
+    app.session_state["panel_section"] = "Тест модели"
+    app.run(timeout=30)
+    assert not app.exception and app.session_state["selected_chat_id"] == "test"
+    assert app.radio(key="panel_section").value == "Чаты и заявки"
+    assert app.button(key="test_chat_tab").proto.type == "primary"
+
+
 def test_panel_settings_status_and_reload(backend: SimpleNamespace) -> None:
     app = panel()
     assert not app.exception
@@ -141,6 +244,54 @@ def test_panel_settings_status_and_reload(backend: SimpleNamespace) -> None:
     assert any("документов — 2" in item.value for item in app.success)
     app.radio(key="panel_section").set_value("Состояние").run()
     assert not app.exception and len(app.warning) == 1
+
+
+@pytest.mark.parametrize(
+    "enabled,reason,kind,message",
+    [
+        (
+            False,
+            "staging",
+            "info",
+            "Автоматическая обработка клиентских обращений отключена в режиме staging.",
+        ),
+        (
+            False,
+            "missing_openrouter_key",
+            "warning",
+            "Ключ OpenRouter не задан; обработчик консультаций выключен.",
+        ),
+        (
+            False,
+            None,
+            "warning",
+            "Автоматическая обработка клиентских обращений отключена.",
+        ),
+        (True, None, None, None),
+    ],
+)
+def test_panel_worker_status_uses_backend_reason(
+    backend: SimpleNamespace,
+    enabled: bool,
+    reason: str | None,
+    kind: str | None,
+    message: str | None,
+) -> None:
+    backend.status["worker_enabled"] = enabled
+    if reason is not None:
+        backend.status["worker_disabled_reason"] = reason
+    # The panel uses local Settings, so staging must be identified by the backend.
+    app = panel()
+    app.radio(key="panel_section").set_value("Состояние").run()
+    assert not app.exception
+    if kind == "info":
+        assert message in [item.value for item in app.info]
+        assert not app.warning
+    elif kind == "warning":
+        assert [item.value for item in app.warning] == [message]
+    else:
+        assert not app.warning
+        assert not any("обработк" in item.value.lower() for item in app.info)
 
 
 def test_panel_activation_keeps_editor_and_removes_suggestion(backend: SimpleNamespace) -> None:

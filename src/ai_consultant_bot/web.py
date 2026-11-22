@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -32,6 +33,7 @@ from ai_consultant_bot.messaging import (
     ingest_event,
     send_text,
 )
+from ai_consultant_bot.model_sandbox import ModelDialogue, load_model_settings
 from ai_consultant_bot.openrouter import OpenRouterClient
 from ai_consultant_bot.processing import run_worker
 from ai_consultant_bot.storage import initialize_database, open_database, recover_interrupted_jobs
@@ -131,6 +133,52 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
     @app.get("/admin/chats", dependencies=[Depends(require_admin)])
     def chats(offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
         return list_chats(settings, offset)
+
+    @app.post("/admin/test-chat/reply", dependencies=[Depends(require_admin)])
+    async def test_chat_reply(request: Request) -> dict[str, Any]:
+        payload = await read_payload(request, settings.webhook_max_bytes)
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"text", "state"}
+            or not isinstance(payload["text"], str)
+            or not payload["text"].strip()
+            or len(payload["text"]) > settings.history_context_chars
+        ):
+            raise HTTPException(400, "Invalid test message")
+        test_settings = settings
+        if not settings.external_apis_enabled:
+            if settings.model_test_env_file is None:
+                raise APIError("openrouter", "external_api_disabled")
+            try:
+                model_settings = await run_in_threadpool(
+                    load_model_settings, settings.model_test_env_file
+                )
+                test_settings = replace(
+                    settings,
+                    environment="local",
+                    register_webhook=False,
+                    openrouter_api_key=model_settings.openrouter_api_key,
+                    openrouter_proxy_url=model_settings.openrouter_proxy_url,
+                    umnico_login="",
+                    umnico_password="",
+                    umnico_api_key="",
+                )
+            except (OSError, ValueError):
+                raise HTTPException(503, "Test model configuration is unavailable") from None
+        selected = await run_in_threadpool(read_settings, settings)
+        test_settings = replace(test_settings, default_model=selected["model"])
+        dialogue = ModelDialogue(test_settings, knowledge=request.app.state.knowledge.documents)
+        try:
+            dialogue.restore(payload["state"])
+        except ValueError:
+            raise HTTPException(400, "Invalid test dialogue state") from None
+        # This route never creates chat rows, jobs or a Umnico sending path.
+        if settings.external_apis_enabled:
+            reply = await dialogue.reply(payload["text"], request.app.state.openrouter)
+        else:
+            async with OpenRouterClient(test_settings, transport=transport) as client:
+                reply = await dialogue.reply(payload["text"], client)
+        return {"reply": reply, "state": dialogue.state(), "model": selected["model"]}
 
     @app.get("/admin/chats/{chat_id}", dependencies=[Depends(require_admin)])
     def detail(chat_id: int, offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
