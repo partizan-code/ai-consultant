@@ -25,6 +25,7 @@ dist/
 *.egg-info/
 
 # Local application data
+knowledge_base/
 *.log
 logs/
 *.db
